@@ -25,6 +25,14 @@ func New(out, err io.Writer) Printer {
 	return Printer{out: out, err: err, color: isTerminal(out)}
 }
 
+func (p Printer) IsTerminal() bool {
+	return p.color
+}
+
+func (p Printer) Output() io.Writer {
+	return p.out
+}
+
 func (p Printer) Header(format string, args ...any) {
 	p.printf(p.out, titleStyle, format+"\n", args...)
 }

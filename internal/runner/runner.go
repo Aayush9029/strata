@@ -143,10 +143,24 @@ func Localize(ctx context.Context, config Config, translator provider.Translator
 	}
 	var sourceIndex *sourcecontext.Index
 	result := Result{Catalogs: len(catalogs), Languages: len(languages)}
-	for _, language := range languages {
+	progress := ui.NewProgress(printer.Output(), printer.IsTerminal())
+	defer progress.Close()
+	for languageIndex, language := range languages {
 		displayName := languageName(language, config.Names)
-		printer.Header("%s (%s)", language, displayName)
-		for _, cat := range catalogs {
+		if printer.IsTerminal() {
+			progress.Send(ui.ProgressEvent{
+				Phase:         "language",
+				Language:      language,
+				LanguageName:  displayName,
+				LanguageIndex: languageIndex + 1,
+				LanguageTotal: len(languages),
+				CatalogTotal:  len(catalogs),
+				Message:       "starting language",
+			})
+		} else {
+			printer.Header("%s (%s)", language, displayName)
+		}
+		for catalogIndex, cat := range catalogs {
 			items := cat.MissingItems(language, config.Force)
 			if len(items) > 0 && config.Project.SmartContext {
 				if sourceIndex == nil {
@@ -164,10 +178,35 @@ func Localize(ctx context.Context, config Config, translator provider.Translator
 			}
 			result.Candidates += len(items)
 			if len(items) == 0 {
-				printer.Dim("  %s: up to date", cat.Path)
+				if printer.IsTerminal() {
+					progress.Send(ui.ProgressEvent{
+						Phase:         "catalog",
+						Language:      language,
+						LanguageName:  displayName,
+						LanguageIndex: languageIndex + 1,
+						LanguageTotal: len(languages),
+						Catalog:       cat.Path,
+						CatalogIndex:  catalogIndex + 1,
+						CatalogTotal:  len(catalogs),
+						Message:       "up to date",
+					})
+				} else {
+					printer.Dim("  %s: up to date", cat.Path)
+				}
 				continue
 			}
-			translated, copied, batches, usage, err := localizeCatalog(ctx, cat, language, displayName, items, config, translator, printer)
+			event := ui.ProgressEvent{
+				Phase:         "catalog",
+				Language:      language,
+				LanguageName:  displayName,
+				LanguageIndex: languageIndex + 1,
+				LanguageTotal: len(languages),
+				Catalog:       cat.Path,
+				CatalogIndex:  catalogIndex + 1,
+				CatalogTotal:  len(catalogs),
+				Candidates:    len(items),
+			}
+			translated, copied, batches, usage, err := localizeCatalog(ctx, cat, language, displayName, items, config, translator, printer, progress, event)
 			if err != nil {
 				return result, err
 			}
@@ -178,10 +217,22 @@ func Localize(ctx context.Context, config Config, translator provider.Translator
 			result.Copied += copied
 			result.Batches += batches
 			result.Usage = result.Usage.Add(usage)
-			if config.DryRun {
-				printer.Status("%s: would fill %d/%d", cat.Path, translated+copied, len(items))
+			if printer.IsTerminal() {
+				event.Phase = "catalog"
+				event.Filled = translated + copied
+				event.Copied = copied
+				if config.DryRun {
+					event.Message = "dry run complete"
+				} else {
+					event.Message = "catalog complete"
+				}
+				progress.Send(event)
 			} else {
-				printer.Status("%s: %d/%d filled", cat.Path, translated+copied, len(items))
+				if config.DryRun {
+					printer.Status("%s: would fill %d/%d", cat.Path, translated+copied, len(items))
+				} else {
+					printer.Status("%s: %d/%d filled", cat.Path, translated+copied, len(items))
+				}
 			}
 			if !config.DryRun && translated+copied > 0 {
 				if err := cat.Write(); err != nil {
@@ -194,7 +245,7 @@ func Localize(ctx context.Context, config Config, translator provider.Translator
 	return result, nil
 }
 
-func localizeCatalog(ctx context.Context, cat *catalog.Catalog, language, displayName string, items []catalog.Item, config Config, translator provider.Translator, printer ui.Printer) (int, int, int, provider.Usage, error) {
+func localizeCatalog(ctx context.Context, cat *catalog.Catalog, language, displayName string, items []catalog.Item, config Config, translator provider.Translator, printer ui.Printer, progress *ui.Progress, event ui.ProgressEvent) (int, int, int, provider.Usage, error) {
 	translated := 0
 	copied := 0
 	usage := provider.Usage{}
@@ -209,15 +260,34 @@ func localizeCatalog(ctx context.Context, cat *catalog.Catalog, language, displa
 		}
 		toTranslate = append(toTranslate, item)
 	}
+	event.Copied = copied
+	event.Filled = copied
+	event.BatchTotal = batchCount(len(toTranslate), config.BatchSize)
+	if printer.IsTerminal() {
+		event.Message = "prepared batches"
+		progress.Send(event)
+	}
 
 	batches := 0
 	for start := 0; start < len(toTranslate); start += config.BatchSize {
 		end := min(start+config.BatchSize, len(toTranslate))
 		batch := toTranslate[start:end]
 		batches++
+		event.BatchIndex = batches
+		event.Filled = translated + copied
+		event.Message = "translating batch"
 		if config.DryRun {
-			printer.Dim("  %s: would translate %d strings", cat.Path, len(batch))
+			event.Message = "planning batch"
+		}
+		progress.Send(event)
+		if config.DryRun {
+			if !printer.IsTerminal() {
+				printer.Dim("  %s: would translate %d strings", cat.Path, len(batch))
+			}
 			translated += len(batch)
+			event.Filled = translated + copied
+			event.Message = "batch planned"
+			progress.Send(event)
 			continue
 		}
 		response, err := translateWithRetry(ctx, translator, provider.Request{
@@ -244,8 +314,18 @@ func localizeCatalog(ctx context.Context, cat *catalog.Catalog, language, displa
 			cat.ApplyTranslation(language, item.Key, item.VariantPath, text)
 			translated++
 		}
+		event.Filled = translated + copied
+		event.Message = "batch complete"
+		progress.Send(event)
 	}
 	return translated, copied, batches, usage, nil
+}
+
+func batchCount(itemCount, batchSize int) int {
+	if itemCount == 0 {
+		return 0
+	}
+	return (itemCount + batchSize - 1) / batchSize
 }
 
 func translateWithRetry(ctx context.Context, translator provider.Translator, request provider.Request) (provider.Response, error) {
