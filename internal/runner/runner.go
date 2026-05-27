@@ -430,12 +430,14 @@ func runInit(args []string, out, stderr io.Writer) error {
 	var catalogs string
 	var discover string
 	var languages string
+	var model string
 	var path string
 	var force bool
 	config := provider.ProjectConfig{SmartContextLimit: 3}
 	flags.StringVar(&path, "config", "strata.json", "Config file to write.")
 	flags.StringVar(&config.AppName, "app-name", "", "App or product name.")
 	flags.StringVar(&config.Description, "description", "", "Short app description.")
+	flags.StringVar(&model, "model", "", "OpenRouter model to write into config.")
 	flags.StringVar(&terms, "terms", "", "Comma-separated protected terms.")
 	flags.StringVar(&style, "style", "", "Comma-separated style rules.")
 	flags.StringVar(&catalogs, "catalogs", "", "Comma-separated .xcstrings files.")
@@ -450,7 +452,7 @@ func runInit(args []string, out, stderr io.Writer) error {
 	printer := ui.New(out, stderr)
 	inferred := projectinfo.Infer(".")
 	if isTerminalReader(os.Stdin) && shouldRunInitWizard(args) {
-		if err := runInitForm(&config, &terms, &style, inferred); err != nil {
+		if err := runInitForm(&config, &model, &terms, &style, inferred); err != nil {
 			return err
 		}
 	} else {
@@ -458,6 +460,9 @@ func runInit(args []string, out, stderr io.Writer) error {
 	}
 	applyInitInference(&config, &terms, &catalogs, &discover, &sourceRoots, inferred)
 	config.ProtectedTerms = splitCSV(terms)
+	if strings.TrimSpace(model) != "" {
+		config.Model = strings.TrimSpace(model)
+	}
 	config.Glossary = splitCSV(glossary)
 	config.StyleGuide = splitCSV(style)
 	config.SourceRoots = splitCSV(sourceRoots)
@@ -500,7 +505,7 @@ func shouldRunInitWizard(args []string) bool {
 		name := strings.TrimPrefix(arg, "--")
 		name, _, _ = strings.Cut(name, "=")
 		switch name {
-		case "app-name", "description", "terms", "style", "catalogs", "discover", "languages", "smart-context", "smart-context-limit", "force":
+		case "app-name", "description", "model", "terms", "style", "catalogs", "discover", "languages", "smart-context", "smart-context-limit", "force":
 			return false
 		}
 	}
@@ -690,7 +695,8 @@ func applyInitInference(config *provider.ProjectConfig, terms, catalogs, discove
 	}
 }
 
-func runInitForm(config *provider.ProjectConfig, terms, style *string, inferred projectinfo.Info) error {
+func runInitForm(config *provider.ProjectConfig, model, terms, style *string, inferred projectinfo.Info) error {
+	modelChoice := defaultModelChoice(config.Model)
 	return huh.NewForm(
 		huh.NewGroup(
 			huh.NewNote().
@@ -706,6 +712,16 @@ func runInitForm(config *provider.ProjectConfig, terms, style *string, inferred 
 				Description("Press Return to use the App Store description, or write a shorter prompt hint.").
 				Placeholder(inferred.Description).
 				Value(&config.Description),
+			huh.NewSelect[string]().
+				Title("Model").
+				Description("OpenRouter model for translation batches. Pick Custom to type another model id.").
+				Options(modelOptions(modelChoice)...).
+				Value(&modelChoice),
+			huh.NewInput().
+				Title("Custom model").
+				Description("Only used when Model is Custom. Example: anthropic/claude-sonnet-4").
+				Placeholder("provider/model").
+				Value(model),
 			huh.NewInput().
 				Title("Protected terms").
 				Description("Comma-separated terms that must not be translated.").
@@ -722,6 +738,10 @@ func runInitForm(config *provider.ProjectConfig, terms, style *string, inferred 
 				Value(&config.SmartContext),
 		),
 	).Run()
+	if modelChoice != customModelOption {
+		*model = modelChoice
+	}
+	return nil
 }
 
 func initSummary(inferred projectinfo.Info) string {
@@ -739,6 +759,41 @@ func initSummary(inferred projectinfo.Info) string {
 		lines = append(lines, "Swift roots: "+strings.Join(inferred.SourceRoots, ", "))
 	}
 	return strings.Join(lines, "\n")
+}
+
+const customModelOption = "__custom__"
+
+func defaultModelChoice(configured string) string {
+	if configured == "" {
+		configured = envDefault("OPENROUTER_MODEL", "google/gemini-2.5-flash")
+	}
+	for _, option := range knownModelOptions {
+		if option.Value == configured {
+			return configured
+		}
+	}
+	return customModelOption
+}
+
+func modelOptions(selected string) []huh.Option[string] {
+	options := make([]huh.Option[string], 0, len(knownModelOptions)+1)
+	for _, option := range knownModelOptions {
+		options = append(options, huh.NewOption(option.Label, option.Value).Selected(option.Value == selected))
+	}
+	options = append(options, huh.NewOption("Custom OpenRouter model", customModelOption).Selected(selected == customModelOption))
+	return options
+}
+
+var knownModelOptions = []struct {
+	Label string
+	Value string
+}{
+	{Label: "Gemini 2.5 Flash (default, fast/cheap)", Value: "google/gemini-2.5-flash"},
+	{Label: "Gemini 2.5 Pro (stronger)", Value: "google/gemini-2.5-pro"},
+	{Label: "Claude Sonnet 4", Value: "anthropic/claude-sonnet-4"},
+	{Label: "Claude 3.5 Haiku (fast)", Value: "anthropic/claude-3.5-haiku"},
+	{Label: "GPT-4.1 Mini", Value: "openai/gpt-4.1-mini"},
+	{Label: "GPT-4.1", Value: "openai/gpt-4.1"},
 }
 
 func chooseInitLanguages(config provider.ProjectConfig) ([]string, error) {
