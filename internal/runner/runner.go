@@ -73,6 +73,8 @@ func Run(ctx context.Context, args []string, version string, out, stderr io.Writ
 		switch args[0] {
 		case "init":
 			return runInit(args[1:], out, stderr)
+		case "run", "translate":
+			return runTranslate(ctx, args[1:], out, stderr)
 		case "--version", "-v", "version":
 			fmt.Fprintf(out, "strata %s\n", version)
 			return nil
@@ -81,7 +83,11 @@ func Run(ctx context.Context, args []string, version string, out, stderr io.Writ
 			return nil
 		}
 	}
+	printHelp(out)
+	return nil
+}
 
+func runTranslate(ctx context.Context, args []string, out, stderr io.Writer) error {
 	config, err := parseArgs(args)
 	if err != nil {
 		return err
@@ -89,7 +95,11 @@ func Run(ctx context.Context, args []string, version string, out, stderr io.Writ
 
 	printer := ui.New(out, stderr)
 	if config.ConfigPath == "" {
-		return errors.New("strata is not initialized; run `strata init` to create strata.json")
+		printer.Warning("strata is not configured")
+		printer.Dim("Run `strata init` first, then run `strata`.")
+		fmt.Fprintln(out)
+		printHelp(out)
+		return errors.New("missing strata.json")
 	}
 	fileProject, err := loadProjectConfig(config.ConfigPath)
 	if err != nil {
@@ -144,9 +154,12 @@ func Localize(ctx context.Context, config Config, translator provider.Translator
 	}
 	var sourceIndex *sourcecontext.Index
 	result := Result{Catalogs: len(catalogs), Languages: len(languages)}
-	progress := ui.NewProgress(printer.Output(), printer.IsTerminal())
+	progress, runCtx := ui.NewProgress(ctx, printer.Output(), printer.IsTerminal())
 	defer progress.Close()
 	for languageIndex, language := range languages {
+		if err := runCtx.Err(); err != nil {
+			return result, err
+		}
 		displayName := languageName(language, config.Names)
 		if printer.IsTerminal() {
 			progress.Send(ui.ProgressEvent{
@@ -207,7 +220,7 @@ func Localize(ctx context.Context, config Config, translator provider.Translator
 				CatalogTotal:  len(catalogs),
 				Candidates:    len(items),
 			}
-			translated, copied, batches, usage, err := localizeCatalog(ctx, cat, language, displayName, items, config, translator, printer, progress, event)
+			translated, copied, batches, usage, err := localizeCatalog(runCtx, cat, language, displayName, items, config, translator, printer, progress, event)
 			if err != nil {
 				return result, err
 			}
@@ -877,10 +890,9 @@ func printHelp(out io.Writer) {
 strata translates missing Xcode string catalog entries.
 
 Usage:
-  strata init --app-name "My App" --description "A grocery scanner" --terms "My App,SKU"
-  strata
-  strata [options] <Localizable.xcstrings...>
-  strata --discover . --language es --language ja
+  strata init
+  strata run
+  strata translate [options] <Localizable.xcstrings...>
 
 Options:
   --language <code>     Target BCP-47 language. Defaults to languages already in the catalog.

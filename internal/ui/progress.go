@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -32,16 +33,19 @@ type Progress struct {
 	enabled bool
 	events  chan ProgressEvent
 	program *tea.Program
+	cancel  context.CancelFunc
 }
 
-func NewProgress(out io.Writer, enabled bool) *Progress {
-	view := &Progress{enabled: enabled}
+func NewProgress(ctx context.Context, out io.Writer, enabled bool) (*Progress, context.Context) {
+	runCtx, cancel := context.WithCancel(ctx)
+	view := &Progress{enabled: enabled, cancel: cancel}
 	if !enabled {
-		return view
+		return view, runCtx
 	}
 	view.events = make(chan ProgressEvent, 16)
 	view.program = tea.NewProgram(progressModel{
 		events: view.events,
+		cancel: cancel,
 		bar: progress.New(
 			progress.WithWidth(34),
 			progress.WithSolidFill("#22C55E"),
@@ -51,7 +55,7 @@ func NewProgress(out io.Writer, enabled bool) *Progress {
 	go func() {
 		_, _ = view.program.Run()
 	}()
-	return view
+	return view, runCtx
 }
 
 func (p *Progress) Send(event ProgressEvent) {
@@ -59,6 +63,16 @@ func (p *Progress) Send(event ProgressEvent) {
 		return
 	}
 	p.events <- event
+}
+
+func (p *Progress) Cancel() {
+	if p == nil || p.cancel == nil {
+		return
+	}
+	p.cancel()
+	if p.program != nil {
+		p.program.Quit()
+	}
 }
 
 func (p *Progress) Close() {
@@ -73,6 +87,7 @@ func (p *Progress) Close() {
 
 type progressModel struct {
 	events <-chan ProgressEvent
+	cancel context.CancelFunc
 	event  ProgressEvent
 	bar    progress.Model
 	width  int
@@ -96,6 +111,15 @@ func (m progressModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = maxInt(value.Width, 48)
 		m.bar.Width = minInt(52, maxInt(24, m.width-24))
+	case tea.KeyMsg:
+		switch value.String() {
+		case "ctrl+c", "q", "esc":
+			if m.cancel != nil {
+				m.cancel()
+			}
+			m.done = true
+			return m, tea.Quit
+		}
 	}
 	return m, nil
 }
