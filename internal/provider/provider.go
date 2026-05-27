@@ -32,6 +32,8 @@ type ProjectConfig struct {
 	LanguageNames      map[string]string `json:"language_names,omitempty"`
 	Model              string            `json:"model,omitempty"`
 	BatchSize          int               `json:"batch_size,omitempty"`
+	BundleID           string            `json:"bundle_id,omitempty"`
+	AppStoreID         string            `json:"app_store_id,omitempty"`
 	AppName            string            `json:"app_name,omitempty"`
 	Description        string            `json:"description,omitempty"`
 	AppContext         string            `json:"app_context,omitempty"`

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/progress"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -34,16 +35,23 @@ type Progress struct {
 }
 
 func NewProgress(out io.Writer, enabled bool) *Progress {
-	progress := &Progress{enabled: enabled}
+	view := &Progress{enabled: enabled}
 	if !enabled {
-		return progress
+		return view
 	}
-	progress.events = make(chan ProgressEvent, 16)
-	progress.program = tea.NewProgram(progressModel{events: progress.events}, tea.WithOutput(out))
+	view.events = make(chan ProgressEvent, 16)
+	view.program = tea.NewProgram(progressModel{
+		events: view.events,
+		bar: progress.New(
+			progress.WithWidth(34),
+			progress.WithSolidFill("#22C55E"),
+		),
+		width: 72,
+	}, tea.WithOutput(out))
 	go func() {
-		_, _ = progress.program.Run()
+		_, _ = view.program.Run()
 	}()
-	return progress
+	return view
 }
 
 func (p *Progress) Send(event ProgressEvent) {
@@ -66,6 +74,8 @@ func (p *Progress) Close() {
 type progressModel struct {
 	events <-chan ProgressEvent
 	event  ProgressEvent
+	bar    progress.Model
+	width  int
 	done   bool
 }
 
@@ -83,6 +93,9 @@ func (m progressModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case progressClosed:
 		m.done = true
 		return m, tea.Quit
+	case tea.WindowSizeMsg:
+		m.width = maxInt(value.Width, 48)
+		m.bar.Width = minInt(52, maxInt(24, m.width-24))
 	}
 	return m, nil
 }
@@ -91,28 +104,65 @@ func (m progressModel) View() string {
 	if m.done || m.event.Phase == "" {
 		return ""
 	}
-	var lines []string
-	title := titleStyle.Render("strata")
-	if m.event.Language != "" {
-		title += " " + dimStyle.Render(fmt.Sprintf("language %d/%d", m.event.LanguageIndex, m.event.LanguageTotal))
+	boxWidth := minInt(78, maxInt(48, m.width-4))
+	rows := []string{
+		lipgloss.JoinHorizontal(lipgloss.Center, titleStyle.Render("strata"), " ", statusPill(m.event.Message)),
+		m.progressRow("Languages", m.languageProgress(), fmt.Sprintf("%d/%d", m.event.LanguageIndex, m.event.LanguageTotal)),
 	}
-	lines = append(lines, title)
-
-	if m.event.Language != "" {
-		lines = append(lines, fmt.Sprintf("%s %s", okStyle.Render(m.event.Language), m.event.LanguageName))
-	}
-	if m.event.Catalog != "" {
-		lines = append(lines, dimStyle.Render(fmt.Sprintf("catalog %d/%d", m.event.CatalogIndex, m.event.CatalogTotal))+" "+filepath.Base(m.event.Catalog))
+	if m.event.CatalogTotal > 0 {
+		rows = append(rows, m.progressRow("Catalogs", m.catalogProgress(), fmt.Sprintf("%d/%d", m.event.CatalogIndex, m.event.CatalogTotal)))
 	}
 	if m.event.BatchTotal > 0 {
-		lines = append(lines, fmt.Sprintf("batch %d/%d  filled %d/%d  copied %d", m.event.BatchIndex, m.event.BatchTotal, m.event.Filled, m.event.Candidates, m.event.Copied))
-	} else if m.event.Candidates > 0 {
-		lines = append(lines, fmt.Sprintf("filled %d/%d  copied %d", m.event.Filled, m.event.Candidates, m.event.Copied))
+		rows = append(rows, m.progressRow("Batches", m.batchProgress(), fmt.Sprintf("%d/%d", m.event.BatchIndex, m.event.BatchTotal)))
 	}
-	if m.event.Message != "" {
-		lines = append(lines, dimStyle.Render(m.event.Message))
+	if m.event.Candidates > 0 {
+		rows = append(rows, m.progressRow("Strings", ratio(m.event.Filled, m.event.Candidates), fmt.Sprintf("%d/%d", m.event.Filled, m.event.Candidates)))
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, lines...) + "\n"
+	rows = append(rows, "")
+	rows = append(rows, labelValue("language", strings.TrimSpace(m.event.Language+" "+m.event.LanguageName)))
+	if m.event.Catalog != "" {
+		rows = append(rows, labelValue("catalog", ShortPath(m.event.Catalog)))
+	}
+	if m.event.Copied > 0 {
+		rows = append(rows, labelValue("copied", fmt.Sprintf("%d non-linguistic strings", m.event.Copied)))
+	}
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("238")).
+		Padding(1, 2).
+		Width(boxWidth).
+		Render(lipgloss.JoinVertical(lipgloss.Left, rows...)) + "\n"
+}
+
+func (m progressModel) progressRow(label string, value float64, count string) string {
+	return lipgloss.JoinHorizontal(
+		lipgloss.Center,
+		dimStyle.Width(10).Render(label),
+		" ",
+		m.bar.ViewAs(value),
+		" ",
+		okStyle.Width(8).Align(lipgloss.Right).Render(count),
+	)
+}
+
+func (m progressModel) languageProgress() float64 {
+	return ratio(maxInt(0, m.event.LanguageIndex-1), m.event.LanguageTotal)
+}
+
+func (m progressModel) catalogProgress() float64 {
+	completed := maxInt(0, m.event.CatalogIndex-1)
+	if m.event.Message == "catalog complete" || m.event.Message == "dry run complete" || m.event.Message == "up to date" {
+		completed = m.event.CatalogIndex
+	}
+	return ratio(completed, m.event.CatalogTotal)
+}
+
+func (m progressModel) batchProgress() float64 {
+	completed := maxInt(0, m.event.BatchIndex-1)
+	if m.event.Message == "batch complete" || m.event.Message == "batch planned" {
+		completed = m.event.BatchIndex
+	}
+	return ratio(completed, m.event.BatchTotal)
 }
 
 func (m progressModel) waitForEvent() tea.Cmd {
@@ -132,4 +182,44 @@ func ShortPath(path string) string {
 		return clean
 	}
 	return filepath.Join(parts[len(parts)-3:]...)
+}
+
+func statusPill(value string) string {
+	if value == "" {
+		value = "working"
+	}
+	return lipgloss.NewStyle().
+		Foreground(lipgloss.Color("230")).
+		Background(lipgloss.Color("28")).
+		Padding(0, 1).
+		Render(value)
+}
+
+func labelValue(label, value string) string {
+	if value == "" {
+		value = "-"
+	}
+	return dimStyle.Width(10).Render(label) + " " + value
+}
+
+func ratio(value, total int) float64 {
+	if total <= 0 {
+		return 0
+	}
+	value = minInt(maxInt(value, 0), total)
+	return float64(value) / float64(total)
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

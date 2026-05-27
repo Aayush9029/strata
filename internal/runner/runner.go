@@ -16,6 +16,7 @@ import (
 	"github.com/charmbracelet/huh"
 
 	"github.com/Aayush9029/strata/internal/catalog"
+	"github.com/Aayush9029/strata/internal/projectinfo"
 	"github.com/Aayush9029/strata/internal/provider"
 	"github.com/Aayush9029/strata/internal/sourcecontext"
 	"github.com/Aayush9029/strata/internal/ui"
@@ -422,11 +423,9 @@ func runInit(args []string, out, stderr io.Writer) error {
 	flags.StringVar(&config.AppName, "app-name", "", "App or product name.")
 	flags.StringVar(&config.Description, "description", "", "Short app description.")
 	flags.StringVar(&terms, "terms", "", "Comma-separated protected terms.")
-	flags.StringVar(&glossary, "glossary", "", "Comma-separated glossary entries.")
 	flags.StringVar(&style, "style", "", "Comma-separated style rules.")
-	flags.StringVar(&sourceRoots, "source-roots", ".", "Comma-separated Swift source roots for smart context.")
 	flags.StringVar(&catalogs, "catalogs", "", "Comma-separated .xcstrings files.")
-	flags.StringVar(&discover, "discover", ".", "Comma-separated roots to discover .xcstrings files.")
+	flags.StringVar(&discover, "discover", "", "Comma-separated roots to discover .xcstrings files.")
 	flags.StringVar(&languages, "languages", "", "Comma-separated BCP-47 languages.")
 	flags.BoolVar(&config.SmartContext, "smart-context", true, "Include Swift file/type/function context in translation prompts.")
 	flags.IntVar(&config.SmartContextLimit, "smart-context-limit", config.SmartContextLimit, "Max source occurrences per string.")
@@ -434,8 +433,10 @@ func runInit(args []string, out, stderr io.Writer) error {
 		return err
 	}
 	printer := ui.New(out, stderr)
+	inferred := projectinfo.Infer(".")
+	applyInitInference(&config, &terms, &catalogs, &discover, &sourceRoots, inferred)
 	if isTerminalReader(os.Stdin) && (config.AppName == "" || config.Description == "") {
-		if err := runInitForm(&config, &terms, &glossary, &style, &sourceRoots); err != nil {
+		if err := runInitForm(&config, &terms, &style); err != nil {
 			return err
 		}
 	}
@@ -518,6 +519,12 @@ func mergeProjectConfig(base, override provider.ProjectConfig) provider.ProjectC
 	if override.BatchSize > 0 {
 		base.BatchSize = override.BatchSize
 	}
+	if override.BundleID != "" {
+		base.BundleID = override.BundleID
+	}
+	if override.AppStoreID != "" {
+		base.AppStoreID = override.AppStoreID
+	}
 	if override.SmartContext {
 		base.SmartContext = true
 	}
@@ -599,36 +606,63 @@ func isTerminalReader(file *os.File) bool {
 	return (stat.Mode() & os.ModeCharDevice) != 0
 }
 
-func runInitForm(config *provider.ProjectConfig, terms, glossary, style, sourceRoots *string) error {
+func applyInitInference(config *provider.ProjectConfig, terms, catalogs, discover, sourceRoots *string, inferred projectinfo.Info) {
+	if config.AppName == "" {
+		config.AppName = inferred.AppName
+	}
+	if config.Description == "" {
+		config.Description = inferred.Description
+	}
+	if config.BundleID == "" {
+		config.BundleID = inferred.BundleID
+	}
+	if config.AppStoreID == "" {
+		config.AppStoreID = inferred.AppStoreID
+	}
+	if strings.TrimSpace(*terms) == "" {
+		*terms = strings.Join(inferred.Terms, ",")
+	}
+	if strings.TrimSpace(*catalogs) == "" && len(inferred.Catalogs) > 0 {
+		*catalogs = strings.Join(inferred.Catalogs, ",")
+	}
+	if strings.TrimSpace(*discover) == "" {
+		if len(inferred.Discover) > 0 {
+			*discover = strings.Join(inferred.Discover, ",")
+		} else {
+			*discover = "."
+		}
+	}
+	if strings.TrimSpace(*sourceRoots) == "" {
+		if len(inferred.SourceRoots) > 0 {
+			*sourceRoots = strings.Join(inferred.SourceRoots, ",")
+		} else {
+			*sourceRoots = "."
+		}
+	}
+}
+
+func runInitForm(config *provider.ProjectConfig, terms, style *string) error {
 	return huh.NewForm(
 		huh.NewGroup(
 			huh.NewInput().
 				Title("App name").
-				Description("The public product name to preserve exactly.").
+				Description("Inferred from Xcode or App Store when possible.").
 				Value(&config.AppName),
 			huh.NewInput().
 				Title("Description").
-				Description("Short product context for translation prompts.").
+				Description("Inferred from App Store public metadata when available.").
 				Value(&config.Description),
 			huh.NewInput().
 				Title("Protected terms").
 				Description("Comma-separated terms that must not be translated.").
 				Value(terms),
 			huh.NewInput().
-				Title("Glossary").
-				Description("Comma-separated glossary entries.").
-				Value(glossary),
-			huh.NewInput().
 				Title("Style guide").
 				Description("Comma-separated tone or copy rules.").
 				Value(style),
-			huh.NewInput().
-				Title("Source roots").
-				Description("Comma-separated Swift source roots for smart context.").
-				Value(sourceRoots),
 			huh.NewConfirm().
 				Title("Enable smart context?").
-				Description("Adds file/type/function/view context to translation prompts.").
+				Description("Uses inferred Swift source roots to add file/type/function/view context.").
 				Value(&config.SmartContext),
 		),
 	).Run()
@@ -648,12 +682,12 @@ func chooseInitLanguages(config provider.ProjectConfig) ([]string, error) {
 			return
 		}
 		seen[locale.Code] = true
-		label := fmt.Sprintf("%s %s  %s", locale.Flag, locale.Code, locale.Name)
+		label := fmt.Sprintf("%s %s  %s", flagForLocale(locale), locale.Code, locale.Name)
 		options = append(options, huh.NewOption(label, locale.Code).Selected(selected))
 	}
 
 	for _, code := range selected {
-		addOption(popularLocale{Code: code, Name: languageName(code, config.LanguageNames), Flag: "•"}, true)
+		addOption(popularLocale{Code: code, Name: languageName(code, config.LanguageNames)}, true)
 	}
 	for _, locale := range popularLocales {
 		addOption(locale, false)
@@ -715,6 +749,54 @@ var popularLocales = []popularLocale{
 	{Code: "bn", Name: "Bangla", Flag: "🇧🇩"},
 	{Code: "sv", Name: "Swedish", Flag: "🇸🇪"},
 	{Code: "zh-Hant", Name: "Chinese, Traditional", Flag: "🇹🇼"},
+}
+
+func flagForLocale(locale popularLocale) string {
+	if locale.Flag != "" {
+		return locale.Flag
+	}
+	base := locale.Code
+	if index := strings.Index(base, "-"); index >= 0 {
+		base = base[:index]
+	}
+	flags := map[string]string{
+		"ar":      "🇸🇦",
+		"bn":      "🇧🇩",
+		"de":      "🇩🇪",
+		"en":      "🇺🇸",
+		"en-AU":   "🇦🇺",
+		"en-CA":   "🇨🇦",
+		"en-GB":   "🇬🇧",
+		"es":      "🇪🇸",
+		"es-419":  "🌎",
+		"es-MX":   "🇲🇽",
+		"es-US":   "🇺🇸",
+		"fa":      "🇮🇷",
+		"fr":      "🇫🇷",
+		"hi":      "🇮🇳",
+		"id":      "🇮🇩",
+		"it":      "🇮🇹",
+		"ja":      "🇯🇵",
+		"ko":      "🇰🇷",
+		"ms":      "🇲🇾",
+		"nl":      "🇳🇱",
+		"pl":      "🇵🇱",
+		"pt-BR":   "🇧🇷",
+		"pt-PT":   "🇵🇹",
+		"ru":      "🇷🇺",
+		"sv":      "🇸🇪",
+		"tr":      "🇹🇷",
+		"vi":      "🇻🇳",
+		"zh-Hans": "🇨🇳",
+		"zh-Hant": "🇹🇼",
+	}
+	if flag := flags[locale.Code]; flag != "" {
+		return flag
+	}
+	if flag := flags[base]; flag != "" {
+		return flag
+	}
+	return "🌐"
 }
 
 func uniqueStrings(values []string) []string {
