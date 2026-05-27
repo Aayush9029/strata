@@ -434,12 +434,14 @@ func runInit(args []string, out, stderr io.Writer) error {
 	}
 	printer := ui.New(out, stderr)
 	inferred := projectinfo.Infer(".")
-	applyInitInference(&config, &terms, &catalogs, &discover, &sourceRoots, inferred)
-	if isTerminalReader(os.Stdin) && (config.AppName == "" || config.Description == "") {
-		if err := runInitForm(&config, &terms, &style); err != nil {
+	if isTerminalReader(os.Stdin) {
+		if err := runInitForm(&config, &terms, &style, inferred); err != nil {
 			return err
 		}
+	} else {
+		applyInitInference(&config, &terms, &catalogs, &discover, &sourceRoots, inferred)
 	}
+	applyInitInference(&config, &terms, &catalogs, &discover, &sourceRoots, inferred)
 	config.ProtectedTerms = splitCSV(terms)
 	config.Glossary = splitCSV(glossary)
 	config.StyleGuide = splitCSV(style)
@@ -641,24 +643,31 @@ func applyInitInference(config *provider.ProjectConfig, terms, catalogs, discove
 	}
 }
 
-func runInitForm(config *provider.ProjectConfig, terms, style *string) error {
+func runInitForm(config *provider.ProjectConfig, terms, style *string, inferred projectinfo.Info) error {
 	return huh.NewForm(
 		huh.NewGroup(
+			huh.NewNote().
+				Title("strata init").
+				Description(initSummary(inferred)),
 			huh.NewInput().
 				Title("App name").
-				Description("Inferred from Xcode or App Store when possible.").
+				Description("Press Return to accept the inferred value, or edit it.").
+				Placeholder(inferred.AppName).
 				Value(&config.AppName),
 			huh.NewInput().
 				Title("Description").
-				Description("Inferred from App Store public metadata when available.").
+				Description("Press Return to use the App Store description, or write a shorter prompt hint.").
+				Placeholder(inferred.Description).
 				Value(&config.Description),
 			huh.NewInput().
 				Title("Protected terms").
 				Description("Comma-separated terms that must not be translated.").
+				Placeholder(strings.Join(inferred.Terms, ",")).
 				Value(terms),
 			huh.NewInput().
 				Title("Style guide").
-				Description("Comma-separated tone or copy rules.").
+				Description("Optional comma-separated tone or copy rules.").
+				Placeholder("clear, concise, native iOS copy").
 				Value(style),
 			huh.NewConfirm().
 				Title("Enable smart context?").
@@ -666,6 +675,23 @@ func runInitForm(config *provider.ProjectConfig, terms, style *string) error {
 				Value(&config.SmartContext),
 		),
 	).Run()
+}
+
+func initSummary(inferred projectinfo.Info) string {
+	lines := []string{"Found project defaults. Press Return on each field to accept its suggested value."}
+	if inferred.BundleID != "" {
+		lines = append(lines, "Bundle ID: "+inferred.BundleID)
+	}
+	if inferred.AppStoreID != "" {
+		lines = append(lines, "App Store ID: "+inferred.AppStoreID)
+	}
+	if len(inferred.Catalogs) > 0 {
+		lines = append(lines, fmt.Sprintf("String catalogs: %d", len(inferred.Catalogs)))
+	}
+	if len(inferred.SourceRoots) > 0 {
+		lines = append(lines, "Swift roots: "+strings.Join(inferred.SourceRoots, ", "))
+	}
+	return strings.Join(lines, "\n")
 }
 
 func chooseInitLanguages(config provider.ProjectConfig) ([]string, error) {
@@ -699,8 +725,10 @@ func chooseInitLanguages(config provider.ProjectConfig) ([]string, error) {
 		huh.NewGroup(
 			huh.NewMultiSelect[string]().
 				Title("Languages").
-				Description("Existing catalog languages are preselected; popular App Store locales are suggested below.").
+				Description("Space toggles a locale. Return accepts the preselected catalog languages. Type / to filter.").
 				Options(options...).
+				Height(14).
+				Filterable(true).
 				Value(&selected),
 		),
 	).Run(); err != nil {
