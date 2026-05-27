@@ -431,6 +431,7 @@ func runInit(args []string, out, stderr io.Writer) error {
 	var discover string
 	var languages string
 	var path string
+	var force bool
 	config := provider.ProjectConfig{SmartContextLimit: 3}
 	flags.StringVar(&path, "config", "strata.json", "Config file to write.")
 	flags.StringVar(&config.AppName, "app-name", "", "App or product name.")
@@ -440,6 +441,7 @@ func runInit(args []string, out, stderr io.Writer) error {
 	flags.StringVar(&catalogs, "catalogs", "", "Comma-separated .xcstrings files.")
 	flags.StringVar(&discover, "discover", "", "Comma-separated roots to discover .xcstrings files.")
 	flags.StringVar(&languages, "languages", "", "Comma-separated BCP-47 languages.")
+	flags.BoolVar(&force, "force", false, "Replace an existing config instead of merging with it.")
 	flags.BoolVar(&config.SmartContext, "smart-context", true, "Include Swift file/type/function context in translation prompts.")
 	flags.IntVar(&config.SmartContextLimit, "smart-context-limit", config.SmartContextLimit, "Max source occurrences per string.")
 	if err := flags.Parse(args); err != nil {
@@ -447,7 +449,7 @@ func runInit(args []string, out, stderr io.Writer) error {
 	}
 	printer := ui.New(out, stderr)
 	inferred := projectinfo.Infer(".")
-	if isTerminalReader(os.Stdin) {
+	if isTerminalReader(os.Stdin) && shouldRunInitWizard(args) {
 		if err := runInitForm(&config, &terms, &style, inferred); err != nil {
 			return err
 		}
@@ -472,6 +474,15 @@ func runInit(args []string, out, stderr io.Writer) error {
 	if config.AppName == "" {
 		return errors.New("app name is required; pass --app-name")
 	}
+	if !force {
+		existing, err := loadProjectConfig(path)
+		if err == nil {
+			config = mergeProjectConfig(existing, config)
+			config = dedupeProjectConfig(config)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return err
@@ -482,6 +493,18 @@ func runInit(args []string, out, stderr io.Writer) error {
 	}
 	printer.Success("wrote %s", path)
 	return nil
+}
+
+func shouldRunInitWizard(args []string) bool {
+	for _, arg := range args {
+		name := strings.TrimPrefix(arg, "--")
+		name, _, _ = strings.Cut(name, "=")
+		switch name {
+		case "app-name", "description", "terms", "style", "catalogs", "discover", "languages", "smart-context", "smart-context-limit", "force":
+			return false
+		}
+	}
+	return true
 }
 
 func loadProjectConfig(path string) (provider.ProjectConfig, error) {
@@ -550,6 +573,17 @@ func mergeProjectConfig(base, override provider.ProjectConfig) provider.ProjectC
 		base.SourceRoots = append(base.SourceRoots, override.SourceRoots...)
 	}
 	return base
+}
+
+func dedupeProjectConfig(config provider.ProjectConfig) provider.ProjectConfig {
+	config.Catalogs = uniqueInOrder(config.Catalogs)
+	config.Discover = uniqueInOrder(config.Discover)
+	config.Languages = uniqueInOrder(config.Languages)
+	config.ProtectedTerms = uniqueInOrder(config.ProtectedTerms)
+	config.Glossary = uniqueInOrder(config.Glossary)
+	config.StyleGuide = uniqueInOrder(config.StyleGuide)
+	config.SourceRoots = uniqueInOrder(config.SourceRoots)
+	return config
 }
 
 func applyProjectDefaults(config *Config) {
@@ -851,6 +885,20 @@ func uniqueStrings(values []string) []string {
 		result = append(result, value)
 	}
 	slices.Sort(result)
+	return result
+}
+
+func uniqueInOrder(values []string) []string {
+	seen := map[string]bool{}
+	result := []string{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		result = append(result, value)
+	}
 	return result
 }
 
