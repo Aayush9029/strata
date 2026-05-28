@@ -6,6 +6,7 @@ import (
 	"io"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/progress"
 	tea "github.com/charmbracelet/bubbletea"
@@ -91,13 +92,15 @@ type progressModel struct {
 	event  ProgressEvent
 	bar    progress.Model
 	width  int
+	tick   int
 	done   bool
 }
 
 type progressClosed struct{}
+type progressTick struct{}
 
 func (m progressModel) Init() tea.Cmd {
-	return m.waitForEvent()
+	return tea.Batch(m.waitForEvent(), m.waitForTick())
 }
 
 func (m progressModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
@@ -105,6 +108,9 @@ func (m progressModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case ProgressEvent:
 		m.event = value
 		return m, m.waitForEvent()
+	case progressTick:
+		m.tick++
+		return m, m.waitForTick()
 	case progressClosed:
 		m.done = true
 		return m, tea.Quit
@@ -128,9 +134,11 @@ func (m progressModel) View() string {
 	if m.done || m.event.Phase == "" {
 		return ""
 	}
-	boxWidth := minInt(78, maxInt(48, m.width-4))
+	viewWidth := minInt(82, maxInt(52, m.width-2))
+	m.bar.Width = minInt(52, maxInt(24, viewWidth-26))
 	rows := []string{
-		lipgloss.JoinHorizontal(lipgloss.Center, titleStyle.Render("strata"), " ", statusPill(m.event.Message)),
+		titleStyle.Render("strata") + " " + dimStyle.Render("press q to stop"),
+		m.scanner(viewWidth - 4),
 		m.progressRow("Languages", m.languageProgress(), fmt.Sprintf("%d/%d", m.event.LanguageIndex, m.event.LanguageTotal)),
 	}
 	if m.event.CatalogTotal > 0 {
@@ -151,10 +159,8 @@ func (m progressModel) View() string {
 		rows = append(rows, labelValue("copied", fmt.Sprintf("%d non-linguistic strings", m.event.Copied)))
 	}
 	return lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("238")).
-		Padding(1, 2).
-		Width(boxWidth).
+		Padding(1, 1).
+		Width(viewWidth).
 		Render(lipgloss.JoinVertical(lipgloss.Left, rows...)) + "\n"
 }
 
@@ -167,6 +173,27 @@ func (m progressModel) progressRow(label string, value float64, count string) st
 		" ",
 		okStyle.Width(8).Align(lipgloss.Right).Render(count),
 	)
+}
+
+func (m progressModel) scanner(width int) string {
+	width = maxInt(16, width)
+	trail := 9
+	span := maxInt(1, width-trail)
+	position := m.tick % (span * 2)
+	if position >= span {
+		position = span*2 - position
+	}
+	cells := make([]string, width)
+	for i := range cells {
+		cells[i] = "─"
+	}
+	for i := 0; i < trail; i++ {
+		index := position + i
+		if index >= 0 && index < width {
+			cells[index] = "━"
+		}
+	}
+	return lipgloss.NewStyle().Foreground(lipgloss.Color("35")).Render(strings.Join(cells, ""))
 }
 
 func (m progressModel) languageProgress() float64 {
@@ -199,6 +226,12 @@ func (m progressModel) waitForEvent() tea.Cmd {
 	}
 }
 
+func (m progressModel) waitForTick() tea.Cmd {
+	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg {
+		return progressTick{}
+	})
+}
+
 func ShortPath(path string) string {
 	clean := filepath.Clean(path)
 	parts := strings.Split(clean, string(filepath.Separator))
@@ -206,17 +239,6 @@ func ShortPath(path string) string {
 		return clean
 	}
 	return filepath.Join(parts[len(parts)-3:]...)
-}
-
-func statusPill(value string) string {
-	if value == "" {
-		value = "working"
-	}
-	return lipgloss.NewStyle().
-		Foreground(lipgloss.Color("230")).
-		Background(lipgloss.Color("28")).
-		Padding(0, 1).
-		Render(value)
 }
 
 func labelValue(label, value string) string {
