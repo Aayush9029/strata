@@ -7,9 +7,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -696,7 +698,8 @@ func applyInitInference(config *provider.ProjectConfig, terms, catalogs, discove
 }
 
 func runInitForm(config *provider.ProjectConfig, model, terms, style *string, inferred projectinfo.Info) error {
-	modelChoice := defaultModelChoice(config.Model)
+	modelChoices := latestModelOptions(config.Model)
+	modelChoice := defaultModelChoice(config.Model, modelChoices)
 	return huh.NewForm(
 		huh.NewGroup(
 			huh.NewNote().
@@ -713,9 +716,9 @@ func runInitForm(config *provider.ProjectConfig, model, terms, style *string, in
 				Placeholder(inferred.Description).
 				Value(&config.Description),
 			huh.NewSelect[string]().
-				Title("Model").
-				Description("OpenRouter model for translation batches. Pick Custom to type another model id.").
-				Options(modelOptions(modelChoice)...).
+				Title("Latest models").
+				Description("Fetched from OpenRouter live models. Pick Custom to type another model id.").
+				Options(modelOptions(modelChoice, modelChoices)...).
 				Value(&modelChoice),
 			huh.NewInput().
 				Title("Custom model").
@@ -763,37 +766,242 @@ func initSummary(inferred projectinfo.Info) string {
 
 const customModelOption = "__custom__"
 
-func defaultModelChoice(configured string) string {
+type modelChoice struct {
+	Label string
+	Value string
+	Score float64
+}
+
+type openRouterModelsResponse struct {
+	Data []openRouterModel `json:"data"`
+}
+
+type openRouterModel struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	Created       int64  `json:"created"`
+	Description   string `json:"description"`
+	ContextLength int    `json:"context_length"`
+	Architecture  struct {
+		InputModalities  []string `json:"input_modalities"`
+		OutputModalities []string `json:"output_modalities"`
+	} `json:"architecture"`
+	Pricing struct {
+		Prompt     string `json:"prompt"`
+		Completion string `json:"completion"`
+	} `json:"pricing"`
+	SupportedParameters []string `json:"supported_parameters"`
+}
+
+func defaultModelChoice(configured string, choices []modelChoice) string {
 	if configured == "" {
-		configured = envDefault("OPENROUTER_MODEL", "google/gemini-2.5-flash")
+		configured = envDefault("OPENROUTER_MODEL", "")
 	}
-	for _, option := range knownModelOptions {
+	for _, option := range choices {
 		if option.Value == configured {
 			return configured
 		}
 	}
-	return customModelOption
+	if configured != "" {
+		return customModelOption
+	}
+	if len(choices) > 0 {
+		return choices[0].Value
+	}
+	return "openrouter/auto"
 }
 
-func modelOptions(selected string) []huh.Option[string] {
-	options := make([]huh.Option[string], 0, len(knownModelOptions)+1)
-	for _, option := range knownModelOptions {
+func modelOptions(selected string, choices []modelChoice) []huh.Option[string] {
+	options := make([]huh.Option[string], 0, len(choices)+1)
+	for _, option := range choices {
 		options = append(options, huh.NewOption(option.Label, option.Value).Selected(option.Value == selected))
 	}
 	options = append(options, huh.NewOption("Custom OpenRouter model", customModelOption).Selected(selected == customModelOption))
 	return options
 }
 
-var knownModelOptions = []struct {
-	Label string
-	Value string
-}{
-	{Label: "Gemini 2.5 Flash (default, fast/cheap)", Value: "google/gemini-2.5-flash"},
-	{Label: "Gemini 2.5 Pro (stronger)", Value: "google/gemini-2.5-pro"},
-	{Label: "Claude Sonnet 4", Value: "anthropic/claude-sonnet-4"},
-	{Label: "Claude 3.5 Haiku (fast)", Value: "anthropic/claude-3.5-haiku"},
-	{Label: "GPT-4.1 Mini", Value: "openai/gpt-4.1-mini"},
-	{Label: "GPT-4.1", Value: "openai/gpt-4.1"},
+func latestModelOptions(configured string) []modelChoice {
+	choices, err := fetchLatestOpenRouterModels()
+	if err != nil || len(choices) == 0 {
+		choices = fallbackModelOptions()
+	}
+	if configured != "" && !containsModel(choices, configured) {
+		choices = append([]modelChoice{{Label: "Current config: " + configured, Value: configured, Score: 999}}, choices...)
+	}
+	if len(choices) > 20 {
+		choices = choices[:20]
+	}
+	return choices
+}
+
+func fetchLatestOpenRouterModels() ([]modelChoice, error) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	response, err := client.Get("https://openrouter.ai/api/v1/models")
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("OpenRouter returned %s", response.Status)
+	}
+	var payload openRouterModelsResponse
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	var choices []modelChoice
+	for _, model := range payload.Data {
+		if !isUsefulTranslationModel(model) {
+			continue
+		}
+		score := scoreOpenRouterModel(model)
+		choices = append(choices, modelChoice{
+			Label: modelLabel(model, score),
+			Value: model.ID,
+			Score: score,
+		})
+	}
+	slices.SortFunc(choices, func(a, b modelChoice) int {
+		if a.Score > b.Score {
+			return -1
+		}
+		if a.Score < b.Score {
+			return 1
+		}
+		return strings.Compare(a.Value, b.Value)
+	})
+	return dedupeModels(choices), nil
+}
+
+func isUsefulTranslationModel(model openRouterModel) bool {
+	if strings.Contains(model.ID, ":free") || strings.HasPrefix(model.ID, "~") {
+		return false
+	}
+	if !containsString(model.Architecture.InputModalities, "text") || !containsString(model.Architecture.OutputModalities, "text") {
+		return false
+	}
+	if !containsString(model.SupportedParameters, "response_format") && !containsString(model.SupportedParameters, "structured_outputs") {
+		return false
+	}
+	prompt := pricePerMillion(model.Pricing.Prompt)
+	completion := pricePerMillion(model.Pricing.Completion)
+	if prompt < 0 || completion < 0 || prompt > 30 || completion > 150 {
+		return false
+	}
+	text := strings.ToLower(model.ID + " " + model.Name + " " + model.Description)
+	if strings.Contains(text, "embedding") || strings.Contains(text, "image generation") || strings.Contains(text, "ocr") {
+		return false
+	}
+	return true
+}
+
+func scoreOpenRouterModel(model openRouterModel) float64 {
+	text := strings.ToLower(model.ID + " " + model.Name + " " + model.Description)
+	score := float64(model.Created) / 86400
+	score += minFloat(float64(model.ContextLength)/200000, 6)
+	prompt := pricePerMillion(model.Pricing.Prompt)
+	completion := pricePerMillion(model.Pricing.Completion)
+	total := prompt + completion
+	switch {
+	case total <= 1:
+		score += 9
+	case total <= 4:
+		score += 7
+	case total <= 12:
+		score += 5
+	default:
+		score += 2
+	}
+	if strings.Contains(text, "translate") || strings.Contains(text, "multilingual") {
+		score += 8
+	}
+	if strings.Contains(text, "reasoning") || strings.Contains(text, "agent") || strings.Contains(text, "instruction") {
+		score += 5
+	}
+	for provider, bonus := range map[string]float64{
+		"anthropic/claude": 7,
+		"google/gemini":    7,
+		"openai/gpt":       6,
+		"qwen/":            5,
+		"mistralai/":       4,
+		"moonshotai/":      4,
+		"x-ai/":            3,
+	} {
+		if strings.Contains(model.ID, provider) {
+			score += bonus
+		}
+	}
+	if strings.Contains(text, "flash") || strings.Contains(text, "fast") || strings.Contains(text, "mini") || strings.Contains(text, "lite") {
+		score += 3
+	}
+	return score
+}
+
+func modelLabel(model openRouterModel, score float64) string {
+	prompt := pricePerMillion(model.Pricing.Prompt)
+	completion := pricePerMillion(model.Pricing.Completion)
+	tier := "balanced"
+	if prompt+completion <= 2 {
+		tier = "cheap"
+	} else if strings.Contains(strings.ToLower(model.Name), "flash") || strings.Contains(strings.ToLower(model.Name), "fast") {
+		tier = "fast"
+	} else if strings.Contains(strings.ToLower(model.Name), "opus") || strings.Contains(strings.ToLower(model.Name), "pro") {
+		tier = "smart"
+	}
+	return fmt.Sprintf("%s · %s · $%.2f/$%.2f per 1M", model.Name, tier, prompt, completion)
+}
+
+func fallbackModelOptions() []modelChoice {
+	return []modelChoice{
+		{Label: "OpenRouter Auto · latest routed model", Value: "openrouter/auto"},
+		{Label: "Claude Opus Latest · smart", Value: "~anthropic/claude-opus-latest"},
+		{Label: "GPT Chat Latest · latest OpenAI chat", Value: "openai/gpt-chat-latest"},
+	}
+}
+
+func dedupeModels(choices []modelChoice) []modelChoice {
+	seen := map[string]bool{}
+	result := []modelChoice{}
+	for _, choice := range choices {
+		if seen[choice.Value] {
+			continue
+		}
+		seen[choice.Value] = true
+		result = append(result, choice)
+	}
+	return result
+}
+
+func containsModel(choices []modelChoice, value string) bool {
+	for _, choice := range choices {
+		if choice.Value == value {
+			return true
+		}
+	}
+	return false
+}
+
+func containsString(values []string, needle string) bool {
+	for _, value := range values {
+		if value == needle {
+			return true
+		}
+	}
+	return false
+}
+
+func pricePerMillion(value string) float64 {
+	price, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 999
+	}
+	return price * 1_000_000
+}
+
+func minFloat(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func chooseInitLanguages(config provider.ProjectConfig) ([]string, error) {
