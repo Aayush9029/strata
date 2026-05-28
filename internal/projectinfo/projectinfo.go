@@ -35,8 +35,9 @@ func Infer(root string) Info {
 	info.AppName = inferAppName(root)
 	info.BundleID = inferBundleID(root)
 	applyAppStoreLookup(&info)
+	info.Terms = []string{"Apple"}
 	if info.AppName != "" {
-		info.Terms = []string{info.AppName}
+		info.Terms = append([]string{info.AppName}, info.Terms...)
 	}
 	return info
 }

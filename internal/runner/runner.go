@@ -717,14 +717,9 @@ func runInitForm(config *provider.ProjectConfig, model, terms, style *string, in
 				Value(&config.Description),
 			huh.NewSelect[string]().
 				Title("Latest models").
-				Description("Fetched from OpenRouter live models. Pick Custom to type another model id.").
+				Description("Fetched from OpenRouter live models.").
 				Options(modelOptions(modelChoice, modelChoices)...).
 				Value(&modelChoice),
-			huh.NewInput().
-				Title("Custom model").
-				Description("Only used when Model is Custom. Example: anthropic/claude-sonnet-4").
-				Placeholder("provider/model").
-				Value(model),
 			huh.NewInput().
 				Title("Protected terms").
 				Description("Comma-separated terms that must not be translated.").
@@ -741,9 +736,7 @@ func runInitForm(config *provider.ProjectConfig, model, terms, style *string, in
 				Value(&config.SmartContext),
 		),
 	).Run()
-	if modelChoice != customModelOption {
-		*model = modelChoice
-	}
+	*model = modelChoice
 	return nil
 }
 
@@ -763,8 +756,6 @@ func initSummary(inferred projectinfo.Info) string {
 	}
 	return strings.Join(lines, "\n")
 }
-
-const customModelOption = "__custom__"
 
 type modelChoice struct {
 	Label string
@@ -803,7 +794,7 @@ func defaultModelChoice(configured string, choices []modelChoice) string {
 		}
 	}
 	if configured != "" {
-		return customModelOption
+		return choices[0].Value
 	}
 	if len(choices) > 0 {
 		return choices[0].Value
@@ -812,11 +803,10 @@ func defaultModelChoice(configured string, choices []modelChoice) string {
 }
 
 func modelOptions(selected string, choices []modelChoice) []huh.Option[string] {
-	options := make([]huh.Option[string], 0, len(choices)+1)
+	options := make([]huh.Option[string], 0, len(choices))
 	for _, option := range choices {
 		options = append(options, huh.NewOption(option.Label, option.Value).Selected(option.Value == selected))
 	}
-	options = append(options, huh.NewOption("Custom OpenRouter model", customModelOption).Selected(selected == customModelOption))
 	return options
 }
 
