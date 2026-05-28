@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/huh"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/Aayush9029/strata/internal/catalog"
 	"github.com/Aayush9029/strata/internal/projectinfo"
@@ -127,13 +128,34 @@ func runTranslate(ctx context.Context, args []string, out, stderr io.Writer) err
 	}
 	result, err := Localize(ctx, config, translator, printer)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			printSummary(printer, config, result, true)
+			return nil
+		}
 		return err
 	}
-	if config.DryRun {
+	printSummary(printer, config, result, false)
+	return nil
+}
+
+func printSummary(printer ui.Printer, config Config, result Result, canceled bool) {
+	if canceled {
+		printer.Warning("stopped after %s", result.Duration.Round(time.Millisecond))
+	} else if config.DryRun {
 		printer.Success("would fill %d strings across %d catalogs and %d languages in %s", result.Planned, result.Catalogs, result.Languages, result.Duration.Round(time.Millisecond))
-		return nil
+	} else {
+		printer.Success("translated %d/%d strings across %d catalogs and %d languages in %s", result.Translated, result.Candidates, result.Catalogs, result.Languages, result.Duration.Round(time.Millisecond))
 	}
-	printer.Success("translated %d/%d strings across %d catalogs and %d languages in %s", result.Translated, result.Candidates, result.Catalogs, result.Languages, result.Duration.Round(time.Millisecond))
+	if canceled {
+		if config.DryRun {
+			printer.Dim("Partial plan: %d/%d strings across %d batches", result.Planned, result.Candidates, result.Batches)
+		} else {
+			printer.Dim("Partial result: %d/%d strings translated, %d copied, %d batches completed", result.Translated, result.Candidates, result.Copied, result.Batches)
+		}
+	}
+	if config.DryRun {
+		return
+	}
 	if result.Usage.TotalTokens > 0 || result.Usage.HasCost {
 		if result.Usage.HasCost {
 			printer.Dim("OpenRouter usage: %d prompt + %d completion = %d tokens, %.6f credits", result.Usage.PromptTokens, result.Usage.CompletionTokens, result.Usage.TotalTokens, result.Usage.Cost)
@@ -141,7 +163,6 @@ func runTranslate(ctx context.Context, args []string, out, stderr io.Writer) err
 			printer.Dim("OpenRouter usage: %d prompt + %d completion = %d tokens", result.Usage.PromptTokens, result.Usage.CompletionTokens, result.Usage.TotalTokens)
 		}
 	}
-	return nil
 }
 
 func Localize(ctx context.Context, config Config, translator provider.Translator, printer ui.Printer) (Result, error) {
@@ -160,6 +181,7 @@ func Localize(ctx context.Context, config Config, translator provider.Translator
 	defer progress.Close()
 	for languageIndex, language := range languages {
 		if err := runCtx.Err(); err != nil {
+			result.Duration = time.Since(started)
 			return result, err
 		}
 		displayName := languageName(language, config.Names)
@@ -177,6 +199,7 @@ func Localize(ctx context.Context, config Config, translator provider.Translator
 			printer.Header("%s (%s)", language, displayName)
 		}
 		for catalogIndex, cat := range catalogs {
+			coverage := cat.Coverage(language)
 			items := cat.MissingItems(language, config.Force)
 			if len(items) > 0 && config.Project.SmartContext {
 				if sourceIndex == nil {
@@ -204,6 +227,8 @@ func Localize(ctx context.Context, config Config, translator provider.Translator
 						Catalog:       cat.Path,
 						CatalogIndex:  catalogIndex + 1,
 						CatalogTotal:  len(catalogs),
+						Existing:      coverage.Translated,
+						Total:         coverage.Total,
 						Message:       "up to date",
 					})
 				} else {
@@ -221,9 +246,24 @@ func Localize(ctx context.Context, config Config, translator provider.Translator
 				CatalogIndex:  catalogIndex + 1,
 				CatalogTotal:  len(catalogs),
 				Candidates:    len(items),
+				Existing:      coverage.Translated,
+				Total:         coverage.Total,
 			}
 			translated, copied, batches, usage, err := localizeCatalog(runCtx, cat, language, displayName, items, config, translator, printer, progress, event)
 			if err != nil {
+				result.Planned += translated + copied
+				if !config.DryRun {
+					result.Translated += translated + copied
+				}
+				result.Copied += copied
+				result.Batches += batches
+				result.Usage = result.Usage.Add(usage)
+				if !config.DryRun && translated+copied > 0 {
+					if writeErr := cat.Write(); writeErr != nil {
+						return result, writeErr
+					}
+				}
+				result.Duration = time.Since(started)
 				return result, err
 			}
 			result.Planned += translated + copied
@@ -700,7 +740,7 @@ func applyInitInference(config *provider.ProjectConfig, terms, catalogs, discove
 func runInitForm(config *provider.ProjectConfig, model, terms, style *string, inferred projectinfo.Info) error {
 	modelChoices := latestModelOptions(config.Model)
 	modelChoice := defaultModelChoice(config.Model, modelChoices)
-	return huh.NewForm(
+	if err := huh.NewForm(
 		huh.NewGroup(
 			huh.NewNote().
 				Title("strata init").
@@ -735,9 +775,26 @@ func runInitForm(config *provider.ProjectConfig, model, terms, style *string, in
 				Description("Uses inferred Swift source roots to add file/type/function/view context.").
 				Value(&config.SmartContext),
 		),
-	).Run()
+	).WithTheme(initTheme()).WithWidth(88).Run(); err != nil {
+		return err
+	}
 	*model = modelChoice
 	return nil
+}
+
+func initTheme() *huh.Theme {
+	theme := huh.ThemeCharm()
+	theme.Focused.Base = theme.Focused.Base.BorderStyle(lipgloss.HiddenBorder()).PaddingLeft(0)
+	theme.Blurred.Base = theme.Blurred.Base.BorderStyle(lipgloss.HiddenBorder()).PaddingLeft(0)
+	theme.Focused.SelectSelector = lipgloss.NewStyle().Foreground(lipgloss.Color("35")).SetString("› ")
+	theme.Focused.MultiSelectSelector = lipgloss.NewStyle().Foreground(lipgloss.Color("35")).SetString("› ")
+	theme.Focused.TextInput.Prompt = lipgloss.NewStyle().Foreground(lipgloss.Color("35")).SetString("› ")
+	theme.Focused.Title = theme.Focused.Title.Foreground(lipgloss.Color("39")).Bold(true)
+	theme.Focused.NoteTitle = theme.Focused.NoteTitle.Foreground(lipgloss.Color("39")).Bold(true)
+	theme.Focused.Description = theme.Focused.Description.Foreground(lipgloss.Color("244"))
+	theme.Focused.SelectedPrefix = lipgloss.NewStyle().Foreground(lipgloss.Color("35")).SetString("✓ ")
+	theme.Focused.UnselectedPrefix = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).SetString("  ")
+	return theme
 }
 
 func initSummary(inferred projectinfo.Info) string {
@@ -1031,7 +1088,7 @@ func chooseInitLanguages(config provider.ProjectConfig) ([]string, error) {
 				Filterable(true).
 				Value(&selected),
 		),
-	).Run(); err != nil {
+	).WithTheme(initTheme()).WithWidth(88).Run(); err != nil {
 		return nil, err
 	}
 	return selected, nil

@@ -48,6 +48,12 @@ type Item struct {
 	UsageContext []UsageContext `json:"usage_context,omitempty"`
 }
 
+type Coverage struct {
+	Total      int
+	Translated int
+	Missing    int
+}
+
 type UsageContext struct {
 	File       string   `json:"file,omitempty"`
 	Type       string   `json:"type,omitempty"`
@@ -218,6 +224,40 @@ func (c *Catalog) MissingItems(language string, force bool) []Item {
 		}
 	}
 	return items
+}
+
+func (c *Catalog) Coverage(language string) Coverage {
+	coverage := Coverage{}
+	for _, key := range c.OrderedKeys {
+		entry := c.Strings[key]
+		sourceLoc := c.sourceLocalization(entry)
+		targetLoc := entry.Localizations[language]
+		sourceLeaves := collectStringUnitLeaves(sourceLoc)
+
+		if len(sourceLeaves) == 0 {
+			source := c.SourceText(key, entry)
+			if strings.TrimSpace(source) == "" {
+				continue
+			}
+			coverage.Total++
+			if targetLoc != nil && targetLoc.Value() != "" {
+				coverage.Translated++
+			}
+			continue
+		}
+
+		for _, sourceLeaf := range sourceLeaves {
+			if strings.TrimSpace(sourceLeaf.Unit.Value) == "" {
+				continue
+			}
+			coverage.Total++
+			if targetLeaf, ok := findStringUnitLeaf(targetLoc, sourceLeaf.Path); ok && targetLeaf.Value != "" {
+				coverage.Translated++
+			}
+		}
+	}
+	coverage.Missing = coverage.Total - coverage.Translated
+	return coverage
 }
 
 func (c *Catalog) ApplyTranslation(language, key string, variantPath []string, value string) {

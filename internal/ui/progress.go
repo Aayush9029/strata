@@ -26,6 +26,8 @@ type ProgressEvent struct {
 	BatchTotal    int
 	Candidates    int
 	Filled        int
+	Existing      int
+	Total         int
 	Copied        int
 	Message       string
 }
@@ -64,16 +66,6 @@ func (p *Progress) Send(event ProgressEvent) {
 		return
 	}
 	p.events <- event
-}
-
-func (p *Progress) Cancel() {
-	if p == nil || p.cancel == nil {
-		return
-	}
-	p.cancel()
-	if p.program != nil {
-		p.program.Quit()
-	}
 }
 
 func (p *Progress) Close() {
@@ -147,7 +139,9 @@ func (m progressModel) View() string {
 	if m.event.BatchTotal > 0 {
 		rows = append(rows, m.progressRow("Batches", m.batchProgress(), fmt.Sprintf("%d/%d", m.event.BatchIndex, m.event.BatchTotal)))
 	}
-	if m.event.Candidates > 0 {
+	if m.event.Total > 0 {
+		rows = append(rows, m.progressRow("Coverage", ratio(m.event.Existing+m.event.Filled, m.event.Total), fmt.Sprintf("%d/%d", m.event.Existing+m.event.Filled, m.event.Total)))
+	} else if m.event.Candidates > 0 {
 		rows = append(rows, m.progressRow("Strings", ratio(m.event.Filled, m.event.Candidates), fmt.Sprintf("%d/%d", m.event.Filled, m.event.Candidates)))
 	}
 	rows = append(rows, "")
