@@ -2,8 +2,8 @@ package catalog
 
 import (
 	"os"
-	"slices"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 

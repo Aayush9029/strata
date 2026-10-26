@@ -269,11 +269,10 @@ func (c *Catalog) Write() error {
 	}
 	root["strings"] = stringsObject
 
-	data, err := json.MarshalIndent(root, "", "  ")
+	data, err := MarshalXcode(root)
 	if err != nil {
 		return err
 	}
-	data = append(data, '\n')
 	return os.WriteFile(c.Path, data, 0644)
 }
 
