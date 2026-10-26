@@ -47,8 +47,9 @@ type Item struct {
 	UsageContext []UsageContext `json:"usage_context,omitempty"`
 	// PreviousTranslation and PreviousError describe a rejected attempt, so
 	// the model can fix it on retry.
-	PreviousTranslation string `json:"previous_translation,omitempty"`
-	PreviousError       string `json:"previous_error,omitempty"`
+	Structure           *EntryStructure `json:"entry_structure,omitempty"`
+	PreviousTranslation string          `json:"previous_translation,omitempty"`
+	PreviousError       string          `json:"previous_error,omitempty"`
 }
 
 type Coverage struct {
@@ -180,6 +181,9 @@ func (c *Catalog) SourceText(key string, entry *Entry) string {
 	return key
 }
 
+// MissingItems lists the strings language still needs. For an entry with
+// substitutions, a missing leaf brings in every leaf of the entry, so the root
+// and its substitution forms are translated together.
 func (c *Catalog) MissingItems(language string, force bool) []Item {
 	items := []Item{}
 	for _, key := range c.OrderedKeys {
@@ -188,25 +192,40 @@ func (c *Catalog) MissingItems(language string, force bool) []Item {
 			continue
 		}
 		targetLoc := entry.Localizations[language]
+		structure := c.entryStructure(entry)
+		var leaves []stringLeaf
+		missing := false
 		for _, leaf := range c.targetLeaves(key, entry, language) {
 			if strings.TrimSpace(leaf.Source) == "" {
 				continue
 			}
-			if !force && hasTranslation(targetLoc, leaf.Path) {
-				continue
+			if force || !hasTranslation(targetLoc, leaf.Path) {
+				missing = true
+				leaves = append(leaves, leaf)
+			} else if structure != nil {
+				leaves = append(leaves, leaf)
 			}
+		}
+		if !missing {
+			continue
+		}
+		for _, leaf := range leaves {
 			var variantPath []string
 			if !slices.Equal(leaf.Path, []string{"stringUnit"}) {
 				variantPath = leaf.Path
 			}
-			items = append(items, Item{
+			item := Item{
 				ID:           fmt.Sprintf("%d", len(items)),
 				Key:          key,
 				Source:       leaf.Source,
 				Comment:      entry.Comment,
 				Placeholders: Placeholders(leaf.Source),
 				VariantPath:  variantPath,
-			})
+			}
+			if structure != nil && variantPath == nil {
+				item.Structure = structure
+			}
+			items = append(items, item)
 		}
 	}
 	return items

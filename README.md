@@ -37,6 +37,8 @@ Use `strata --help` for overrides like model, dry-run, force, or a custom config
 
 `strata run` sends 4 batches in parallel. Change this with `--concurrency <n>` or `"concurrency"` in `strata.json`. It writes each catalog after every batch, so a stopped run keeps its progress. Strings that still fail placeholder or protected-term checks after two retries are skipped and listed at the end.
 
+To translate specific keys again, run `strata run --key "<key>" --force`. Repeat `--key` for more keys.
+
 ## License
 
 MIT

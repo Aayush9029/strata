@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -351,5 +352,168 @@ func TestLocalizeStringSetSkipsPhraseWithoutApplicationName(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `"[es] Play in ${applicationName}"`) || !strings.Contains(string(data), `"state" : "new"`) {
 		t.Fatalf("catalog:\n%s", data)
+	}
+}
+
+const substitutionCatalog = `{"sourceLanguage":"en","strings":{
+"%1$@ · %#@titles@":{"localizations":{"en":{"stringUnit":{"state":"translated","value":"%1$@ · %#@titles@"},"substitutions":{"titles":{"argNum":2,"formatSpecifier":"lld","variations":{"plural":{"one":{"stringUnit":{"state":"translated","value":"%arg title in your library"}},"other":{"stringUnit":{"state":"translated","value":"%arg titles in your library"}}}}}}}}},
+"Scan":{"localizations":{"en":{"stringUnit":{"state":"translated","value":"Scan"}}}}
+},"version":"1.0"}`
+
+// repeatingTranslator repeats the substitution words in the root until the
+// request reports the previous error.
+type repeatingTranslator struct {
+	mu       sync.Mutex
+	requests [][]catalog.Item
+}
+
+func (r *repeatingTranslator) Translate(_ context.Context, request provider.Request) (provider.Response, error) {
+	r.mu.Lock()
+	r.requests = append(r.requests, request.Items)
+	r.mu.Unlock()
+	result := map[string]string{}
+	for _, item := range request.Items {
+		switch {
+		case item.Key == "Scan":
+			result[item.ID] = "Scannen"
+		case item.VariantPath == nil && item.PreviousError == "":
+			result[item.ID] = "%1$@ · %#@titles@ Titel in deiner Mediathek"
+		case item.VariantPath == nil:
+			result[item.ID] = "%1$@ · %#@titles@"
+		default:
+			result[item.ID] = "%arg Titel in deiner Mediathek"
+		}
+	}
+	return provider.Response{Translations: result}, nil
+}
+
+func TestLocalizeRejectsRepeatedSubstitutionWords(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "Localizable.xcstrings")
+	if err := os.WriteFile(path, []byte(substitutionCatalog), 0644); err != nil {
+		t.Fatal(err)
+	}
+	translator := &repeatingTranslator{}
+	result, err := Localize(context.Background(), Config{
+		CatalogPaths: []string{path},
+		Languages:    []string{"de"},
+		Names:        map[string]string{},
+		BatchSize:    2,
+	}, translator, ui.New(&bytes.Buffer{}, &bytes.Buffer{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Skipped) != 0 || result.Translated != 4 {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	if len(translator.requests[0]) != 3 {
+		t.Fatalf("the entry was split across requests: %#v", translator.requests[0])
+	}
+	retry := translator.requests[1]
+	if len(retry) != 3 || !strings.Contains(retry[0].PreviousError, "repeats") || retry[0].Structure == nil {
+		t.Fatalf("retry request = %#v", retry)
+	}
+	cat, err := catalog.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cat.Strings["%1$@ · %#@titles@"].Localizations["de"].Value(); got != "%1$@ · %#@titles@" {
+		t.Fatalf("root = %q", got)
+	}
+}
+
+type emptyTranslator struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (e *emptyTranslator) Translate(ctx context.Context, request provider.Request) (provider.Response, error) {
+	e.mu.Lock()
+	e.calls++
+	e.mu.Unlock()
+	if request.Items[0].Key == "Key 0" {
+		return provider.Response{}, &provider.ResponseError{Message: "OpenRouter returned no choices: {}"}
+	}
+	return provider.Mock{}.Translate(ctx, request)
+}
+
+func TestLocalizeSkipsBatchAfterEmptyResponses(t *testing.T) {
+	previous := retryDelay
+	retryDelay = func(int) time.Duration { return 0 }
+	defer func() { retryDelay = previous }()
+
+	path := writeCatalog(t, 4)
+	translator := &emptyTranslator{}
+	result, err := Localize(context.Background(), Config{
+		CatalogPaths: []string{path},
+		Languages:    []string{"es"},
+		Names:        map[string]string{},
+		BatchSize:    2,
+	}, translator, ui.New(&bytes.Buffer{}, &bytes.Buffer{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Translated != 2 || len(result.Skipped) != 2 || !strings.Contains(result.Skipped[0].Reason, "no choices") {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	if translator.calls != 6 {
+		t.Fatalf("calls = %d, want 5 attempts plus 1", translator.calls)
+	}
+}
+
+type unauthorizedTranslator struct{ calls int }
+
+func (u *unauthorizedTranslator) Translate(context.Context, provider.Request) (provider.Response, error) {
+	u.calls++
+	return provider.Response{}, &provider.StatusError{StatusCode: 401, Message: "OpenRouter returned 401"}
+}
+
+func TestLocalizeStopsOnClientError(t *testing.T) {
+	translator := &unauthorizedTranslator{}
+	_, err := Localize(context.Background(), Config{
+		CatalogPaths: []string{writeCatalog(t, 2)},
+		Languages:    []string{"es"},
+		Names:        map[string]string{},
+		BatchSize:    10,
+	}, translator, ui.New(&bytes.Buffer{}, &bytes.Buffer{}))
+	if err == nil || translator.calls != 1 {
+		t.Fatalf("err = %v, calls = %d", err, translator.calls)
+	}
+}
+
+func TestLocalizeKeyFilterWithForce(t *testing.T) {
+	path := writeCatalog(t, 5)
+	config := Config{
+		CatalogPaths: []string{path},
+		Languages:    []string{"es"},
+		Names:        map[string]string{},
+		BatchSize:    10,
+	}
+	if _, err := Localize(context.Background(), config, provider.Mock{}, ui.New(&bytes.Buffer{}, &bytes.Buffer{})); err != nil {
+		t.Fatal(err)
+	}
+	config.Keys = []string{"Key 3"}
+	config.Force = true
+	result, err := Localize(context.Background(), config, provider.Mock{}, ui.New(&bytes.Buffer{}, &bytes.Buffer{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Candidates != 1 || result.Translated != 1 {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	parsed, err := parseArgs([]string{"--key", "A", "--key", "B", "--force"})
+	if err != nil || !slices.Equal(parsed.Keys, []string{"A", "B"}) || !parsed.Force {
+		t.Fatalf("parsed = %#v, err = %v", parsed, err)
+	}
+}
+
+func TestSplitBatchesKeepsEntriesTogether(t *testing.T) {
+	items := []catalog.Item{{Key: "a"}, {Key: "b"}, {Key: "b"}, {Key: "b"}, {Key: "c"}}
+	batches := splitBatches(items, 2)
+	var sizes []int
+	for _, batch := range batches {
+		sizes = append(sizes, len(batch))
+	}
+	if !slices.Equal(sizes, []int{1, 3, 1}) {
+		t.Fatalf("sizes = %v", sizes)
 	}
 }

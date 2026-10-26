@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -88,13 +89,17 @@ func (c ProjectConfig) AllProtectedTerms() []string {
 type OpenRouter struct {
 	APIKey     string
 	Model      string
+	Endpoint   string
 	HTTPClient *http.Client
 }
 
+const openRouterEndpoint = "https://openrouter.ai/api/v1/chat/completions"
+
 func NewOpenRouter(apiKey, model string, timeout time.Duration) *OpenRouter {
 	return &OpenRouter{
-		APIKey: apiKey,
-		Model:  model,
+		APIKey:   apiKey,
+		Model:    model,
+		Endpoint: openRouterEndpoint,
 		HTTPClient: &http.Client{
 			Timeout: timeout,
 		},
@@ -146,7 +151,11 @@ func (o *OpenRouter) Translate(ctx context.Context, request Request) (Response, 
 		return Response{}, err
 	}
 
-	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://openrouter.ai/api/v1/chat/completions", bytes.NewReader(body))
+	endpoint := o.Endpoint
+	if endpoint == "" {
+		endpoint = openRouterEndpoint
+	}
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return Response{}, err
 	}
@@ -166,12 +175,13 @@ func (o *OpenRouter) Translate(ctx context.Context, request Request) (Response, 
 		return Response{}, err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return Response{}, fmt.Errorf("OpenRouter returned %s: %s", response.Status, strings.TrimSpace(string(responseBody)))
+		return Response{}, &StatusError{StatusCode: response.StatusCode, Message: fmt.Sprintf("OpenRouter returned %s: %s", response.Status, truncate(string(responseBody), 500))}
 	}
 
 	var completion struct {
 		Choices []struct {
-			Message struct {
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
 				Content string `json:"content"`
 			} `json:"message"`
 		} `json:"choices"`
@@ -183,15 +193,16 @@ func (o *OpenRouter) Translate(ctx context.Context, request Request) (Response, 
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(responseBody, &completion); err != nil {
-		return Response{}, err
+		return Response{}, &ResponseError{Message: fmt.Sprintf("decode OpenRouter response: %v: %s", err, truncate(string(responseBody), 500))}
 	}
 	if len(completion.Choices) == 0 {
-		return Response{}, fmt.Errorf("OpenRouter returned no choices")
+		return Response{}, &ResponseError{Message: "OpenRouter returned no choices: " + truncate(string(responseBody), 500)}
 	}
 
+	choice := completion.Choices[0]
 	result := map[string]string{}
-	if err := json.Unmarshal([]byte(completion.Choices[0].Message.Content), &result); err != nil {
-		return Response{}, fmt.Errorf("decode model JSON: %w", err)
+	if err := json.Unmarshal([]byte(choice.Message.Content), &result); err != nil {
+		return Response{}, &ResponseError{Message: fmt.Sprintf("decode model JSON (finish_reason %q): %v: %s", choice.FinishReason, err, truncate(choice.Message.Content, 500))}
 	}
 	return Response{
 		Translations: result,
@@ -203,6 +214,44 @@ func (o *OpenRouter) Translate(ctx context.Context, request Request) (Response, 
 			HasCost:          len(completion.Usage.Cost) > 0 && string(completion.Usage.Cost) != "null",
 		},
 	}, nil
+}
+
+// ResponseError means the provider answered but the answer was unusable, for
+// example no choices or invalid JSON. It is retryable.
+type ResponseError struct {
+	Message string
+}
+
+func (e *ResponseError) Error() string {
+	return e.Message
+}
+
+// StatusError is a non-2xx HTTP response.
+type StatusError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *StatusError) Error() string {
+	return e.Message
+}
+
+// Retryable reports whether a request that failed with err can succeed on a
+// later attempt. Client errors such as a bad API key cannot.
+func Retryable(err error) bool {
+	var status *StatusError
+	if errors.As(err, &status) {
+		return status.StatusCode == 408 || status.StatusCode == 429 || status.StatusCode >= 500
+	}
+	return true
+}
+
+func truncate(text string, limit int) string {
+	text = strings.TrimSpace(text)
+	if len(text) <= limit {
+		return text
+	}
+	return text[:limit] + "…"
 }
 
 type Mock struct{}
@@ -233,6 +282,7 @@ func promptRules(project ProjectConfig) []string {
 		"Keep every placeholder in an item's placeholders list exactly as written: printf specifiers such as %@, %lld, and %1$@, %#@name@ substitution tokens, %arg, and App Shortcuts tokens such as ${applicationName}. Do not translate, add, or remove placeholders.",
 		"If the target word order needs a different argument order, use positional specifiers such as %1$@ and %2$@ (keep the type, e.g. %2$lld).",
 		"variant_path shows where the string goes. After plural comes a CLDR plural category (zero, one, two, few, many, or other): write the grammatical form of the target language for that category. After device comes a device name such as iphone, ipad, or mac: write the text for that device. After stringSet.values comes the index of one App Shortcuts phrase: write a natural phrase a user would say to Siri, and keep ${applicationName}.",
+		"Items with the same key and an entry_structure form one entry with %#@name@ substitutions; rendered_examples show the full English sentences. The root item (no variant_path) keeps only the text outside the %#@name@ tokens. Each substitution form (variant_path substitutions.<name>...) contains the full phrase for that token, with %arg for the number. Never repeat substitution words in the root.",
 		"If an item has previous_error, your previous translation (previous_translation) was rejected for that reason. Fix the problem in the new translation.",
 		"Use the comment and usage_context to understand each string. usage_context gives the Swift file, type, view, function, and code snippet; role names the UI element (button, navigation title, alert title, and so on); interpolations name the Swift expressions that fill the placeholders, in order.",
 		"Keep UI strings concise. Button labels, titles, tabs, and menu items must stay short.",

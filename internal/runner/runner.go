@@ -56,6 +56,7 @@ type Config struct {
 	Model         string
 	BatchSize     int
 	Concurrency   int
+	Keys          []string
 	Force         bool
 	DryRun        bool
 	ProviderName  string
@@ -223,7 +224,7 @@ func Localize(ctx context.Context, config Config, translator provider.Translator
 		}
 		for catalogIndex, cat := range catalogs {
 			coverage := cat.Coverage(language)
-			items := cat.MissingItems(language, config.Force)
+			items := filterKeys(cat.MissingItems(language, config.Force), config.Keys)
 			if len(items) > 0 && config.Project.SmartContext {
 				if sourceIndex == nil {
 					index, err := sourcecontext.Build(config.Project.SourceRoots)
@@ -310,6 +311,19 @@ func Localize(ctx context.Context, config Config, translator provider.Translator
 	}
 	result.Duration = time.Since(started)
 	return result, nil
+}
+
+func filterKeys(items []catalog.Item, keys []string) []catalog.Item {
+	if len(keys) == 0 {
+		return items
+	}
+	var filtered []catalog.Item
+	for _, item := range items {
+		if slices.Contains(keys, item.Key) {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
 }
 
 type catalogOutcome struct {
@@ -421,10 +435,26 @@ feed:
 	return outcome, ctx.Err()
 }
 
+// splitBatches splits items into batches of about size items. Items of one
+// entry stay in one batch, so substitution roots and forms are translated
+// together.
 func splitBatches(items []catalog.Item, size int) [][]catalog.Item {
 	var batches [][]catalog.Item
-	for start := 0; start < len(items); start += size {
-		batches = append(batches, items[start:min(start+size, len(items))])
+	var current []catalog.Item
+	for start := 0; start < len(items); {
+		end := start + 1
+		for end < len(items) && items[end].Key == items[start].Key {
+			end++
+		}
+		if len(current) > 0 && len(current)+end-start > size {
+			batches = append(batches, current)
+			current = nil
+		}
+		current = append(current, items[start:end]...)
+		start = end
+	}
+	if len(current) > 0 {
+		batches = append(batches, current)
 	}
 	return batches
 }
@@ -457,37 +487,105 @@ func translateBatch(ctx context.Context, translator provider.Translator, request
 	result := batchResult{}
 	pending := request.Items
 	terms := request.Project.AllProtectedTerms()
+	skip := func(items []catalog.Item, reason func(catalog.Item) string) {
+		for _, item := range items {
+			result.Skipped = append(result.Skipped, Skip{
+				Catalog:  catalogPath,
+				Language: request.LanguageCode,
+				Key:      item.Key,
+				Variant:  strings.Join(item.VariantPath, "."),
+				Reason:   reason(item),
+			})
+		}
+	}
 	for attempt := 0; attempt <= validationRetries && len(pending) > 0; attempt++ {
 		request.Items = pending
 		response, err := translateWithRetry(ctx, translator, request)
 		if err != nil {
+			var responseErr *provider.ResponseError
+			if errors.As(err, &responseErr) {
+				skip(pending, func(catalog.Item) string { return err.Error() })
+				return result, nil
+			}
 			return result, err
 		}
 		result.Usage = result.Usage.Add(response.Usage)
-		var failed []catalog.Item
+		texts := map[string]string{}
+		reasons := map[string]string{}
 		for _, item := range pending {
 			text, ok := response.Translations[item.ID]
-			reason := validateItem(item, text, ok, terms)
-			if reason == "" {
-				result.Translations = append(result.Translations, acceptedTranslation{Item: item, Text: text})
+			texts[item.ID] = text
+			if reason := validateItem(item, text, ok, terms); reason != "" {
+				reasons[item.ID] = reason
+			}
+		}
+		validateSubstitutionGroups(pending, texts, reasons)
+		var failed []catalog.Item
+		for _, item := range pending {
+			if reasons[item.ID] == "" {
+				result.Translations = append(result.Translations, acceptedTranslation{Item: item, Text: texts[item.ID]})
 				continue
 			}
-			item.PreviousTranslation = text
-			item.PreviousError = reason
+			item.PreviousTranslation = texts[item.ID]
+			item.PreviousError = reasons[item.ID]
 			failed = append(failed, item)
 		}
 		pending = failed
 	}
-	for _, item := range pending {
-		result.Skipped = append(result.Skipped, Skip{
-			Catalog:  catalogPath,
-			Language: request.LanguageCode,
-			Key:      item.Key,
-			Variant:  strings.Join(item.VariantPath, "."),
-			Reason:   item.PreviousError,
-		})
-	}
+	skip(pending, func(item catalog.Item) string { return item.PreviousError })
 	return result, nil
+}
+
+// validateSubstitutionGroups treats the root and substitution forms of one
+// entry as a unit: if one fails, all fail, and the root must not repeat the
+// words of a substitution form.
+func validateSubstitutionGroups(items []catalog.Item, texts, reasons map[string]string) {
+	groups := map[string][]catalog.Item{}
+	var keys []string
+	for _, item := range items {
+		_, isSubstitution := catalog.IsSubstitutionPath(item.VariantPath)
+		if item.Structure == nil && !isSubstitution {
+			continue
+		}
+		if groups[item.Key] == nil {
+			keys = append(keys, item.Key)
+		}
+		groups[item.Key] = append(groups[item.Key], item)
+	}
+	for _, key := range keys {
+		group := groups[key]
+		reason := ""
+		for _, item := range group {
+			if reasons[item.ID] != "" {
+				reason = reasons[item.ID]
+				break
+			}
+		}
+		if reason == "" {
+			root, hasRoot := "", false
+			forms := map[string][]string{}
+			for _, item := range group {
+				if name, ok := catalog.IsSubstitutionPath(item.VariantPath); ok {
+					forms[name] = append(forms[name], texts[item.ID])
+				} else if item.VariantPath == nil {
+					root, hasRoot = texts[item.ID], true
+				}
+			}
+			if hasRoot {
+				if err := catalog.CheckSubstitutionRepetition(root, forms); err != nil {
+					reason = err.Error()
+				}
+			}
+		}
+		if reason == "" {
+			continue
+		}
+		for _, item := range group {
+			if reasons[item.ID] == "" {
+				reasons[item.ID] = "another string of this entry failed: " + reason
+			}
+		}
+	}
 }
 
 func validateItem(item catalog.Item, text string, ok bool, terms []string) string {
@@ -503,18 +601,31 @@ func validateItem(item catalog.Item, text string, ok bool, terms []string) strin
 	return ""
 }
 
+// retryDelay is the wait before attempt+1. Tests replace it.
+var retryDelay = func(attempt int) time.Duration {
+	return time.Duration(1<<attempt) * time.Second
+}
+
+const providerAttempts = 5
+
 func translateWithRetry(ctx context.Context, translator provider.Translator, request provider.Request) (provider.Response, error) {
 	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < providerAttempts; attempt++ {
 		result, err := translator.Translate(ctx, request)
 		if err == nil {
 			return result, nil
 		}
 		lastErr = err
+		if ctx.Err() != nil {
+			return provider.Response{}, ctx.Err()
+		}
+		if !provider.Retryable(err) || attempt == providerAttempts-1 {
+			break
+		}
 		select {
 		case <-ctx.Done():
 			return provider.Response{}, ctx.Err()
-		case <-time.After(time.Duration(1<<attempt) * time.Second):
+		case <-time.After(retryDelay(attempt)):
 		}
 	}
 	return provider.Response{}, lastErr
@@ -527,6 +638,7 @@ func parseArgs(args []string) (Config, error) {
 	var languages multiFlag
 	var names multiFlag
 	var discovers multiFlag
+	var keys multiFlag
 	config := Config{
 		Names:        map[string]string{},
 		Model:        envDefault("OPENROUTER_MODEL", "google/gemini-2.5-flash"),
@@ -540,6 +652,7 @@ func parseArgs(args []string) (Config, error) {
 	flags.StringVar(&config.Model, "model", config.Model, "OpenRouter model name.")
 	flags.IntVar(&config.BatchSize, "batch-size", config.BatchSize, "Strings per translation request.")
 	flags.IntVar(&config.Concurrency, "concurrency", config.Concurrency, "Translation requests to run in parallel.")
+	flags.Var(&keys, "key", "Only translate this catalog key. Repeat for multiple keys.")
 	flags.BoolVar(&config.Force, "force", false, "Translate even when a target localization already exists.")
 	flags.BoolVar(&config.DryRun, "dry-run", false, "Report work without writing files or calling the provider.")
 	flags.StringVar(&config.ProviderName, "provider", config.ProviderName, "Translation provider: openrouter or mock.")
@@ -559,6 +672,7 @@ func parseArgs(args []string) (Config, error) {
 	config.Timeout = time.Duration(*timeoutSeconds) * time.Second
 	config.Languages = languages
 	config.DiscoverRoots = discovers
+	config.Keys = keys
 	if config.ConfigPath == "" {
 		if _, err := os.Stat("strata.json"); err == nil {
 			config.ConfigPath = "strata.json"
@@ -1420,7 +1534,8 @@ Options:
   --config <path>       JSON project config. Defaults to strata.json when present.
   --batch-size <n>      Strings per provider request. Default: 40.
   --concurrency <n>     Provider requests to run in parallel. Default: 4.
-  --force               Re-translate existing target values.
+  --key <key>           Only translate this catalog key. Repeat for multiple keys.
+  --force               Re-translate existing target values. Combine with --key for specific keys.
   --dry-run             Count missing strings without writing or calling the provider.
   --provider <name>     openrouter or mock. Default: openrouter.
   --discover <path>     Recursively find .xcstrings files. Repeat for multiple roots.
