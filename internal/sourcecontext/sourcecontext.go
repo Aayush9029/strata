@@ -53,7 +53,7 @@ func Build(roots []string) (*Index, error) {
 		return nil, errors.New("smart_context requires ast-grep; install it or set smart_context to false")
 	}
 
-	strings, err := runAstGrep(`"$TEXT"`, roots)
+	literals, err := runAstGrepScan(`{"id":"strata-string","language":"swift","rule":{"kind":"line_string_literal"}}`, roots)
 	if err != nil {
 		return nil, err
 	}
@@ -63,15 +63,25 @@ func Build(roots []string) (*Index, error) {
 	}
 
 	index := &Index{occurrences: map[string][]catalog.UsageContext{}}
-	for _, match := range strings {
-		value := match.MetaVariables.Single["TEXT"].Text
-		if value == "" {
+	for _, match := range literals {
+		literal := parseSwiftLiteral(match.Text)
+		if literal.Normalized == "" {
 			continue
 		}
 		context := contextFor(match, declarations)
-		index.occurrences[value] = append(index.occurrences[value], context)
+		context.Interpolations = literal.Interpolations
+		index.add(literal.Normalized, context)
+		if len(literal.Interpolations) == 0 {
+			if normalized := NormalizeFormat(literal.Normalized); normalized != literal.Normalized {
+				index.add(normalized, context)
+			}
+		}
 	}
 	return index, nil
+}
+
+func (i *Index) add(key string, context catalog.UsageContext) {
+	i.occurrences[key] = appendUniqueContext(i.occurrences[key], context)
 }
 
 func (i *Index) Attach(items []catalog.Item, limit int) []catalog.Item {
@@ -85,7 +95,7 @@ func (i *Index) Attach(items []catalog.Item, limit int) []catalog.Item {
 }
 
 func (i *Index) Find(key, source string, limit int) []catalog.UsageContext {
-	needles := compactNeedles(key, source)
+	needles := compactNeedles(key, source, NormalizeFormat(key), NormalizeFormat(source))
 	contexts := []catalog.UsageContext{}
 	for _, needle := range needles {
 		for _, context := range i.occurrences[needle] {
@@ -107,6 +117,10 @@ func findDeclarations(roots []string) ([]declaration, error) {
 		{Kind: "class", Pattern: `class $NAME { $$$ }`},
 		{Kind: "actor", Pattern: `actor $NAME { $$$ }`},
 		{Kind: "enum", Pattern: `enum $NAME { $$$ }`},
+		{Kind: "struct", Pattern: `struct $NAME: $$$TYPES { $$$ }`},
+		{Kind: "class", Pattern: `class $NAME: $$$TYPES { $$$ }`},
+		{Kind: "actor", Pattern: `actor $NAME: $$$TYPES { $$$ }`},
+		{Kind: "enum", Pattern: `enum $NAME: $$$TYPES { $$$ }`},
 		{Kind: "func", Pattern: `func $NAME($$$) { $$$ }`},
 		{Kind: "var", Pattern: `var $NAME: $$$`},
 	}
@@ -138,6 +152,7 @@ func contextFor(match astGrepMatch, declarations []declaration) catalog.UsageCon
 		File:    match.File,
 		Line:    match.Range.Start.Line,
 		Snippet: strings.TrimSpace(match.Lines),
+		Role:    roleFor(match.Lines, match.Range.Start.Column),
 	}
 	for _, declaration := range declarations {
 		if declaration.File != match.File || !containsLine(declaration.Range, match.Range.Start.Line) {
@@ -159,8 +174,14 @@ func contextFor(match astGrepMatch, declarations []declaration) catalog.UsageCon
 }
 
 func runAstGrep(pattern string, roots []string) ([]astGrepMatch, error) {
-	args := []string{"run", "--lang", "swift", "--pattern", pattern, "--json=stream"}
-	args = append(args, roots...)
+	return runAstGrepCommand(pattern, append([]string{"run", "--lang", "swift", "--pattern", pattern, "--json=stream"}, roots...))
+}
+
+func runAstGrepScan(rule string, roots []string) ([]astGrepMatch, error) {
+	return runAstGrepCommand(rule, append([]string{"scan", "--inline-rules", rule, "--json=stream"}, roots...))
+}
+
+func runAstGrepCommand(pattern string, args []string) ([]astGrepMatch, error) {
 	command := exec.Command("ast-grep", args...)
 
 	var stdout bytes.Buffer

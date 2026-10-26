@@ -60,6 +60,10 @@ type UsageContext struct {
 	Line       int      `json:"line,omitempty"`
 	References []string `json:"references,omitempty"`
 	Snippet    string   `json:"snippet,omitempty"`
+	Role       string   `json:"role,omitempty"`
+	// Interpolations lists the Swift expressions that fill the format
+	// specifiers, in order.
+	Interpolations []string `json:"interpolations,omitempty"`
 }
 
 type stringLeaf struct {
