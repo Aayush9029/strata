@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"os"
+	"slices"
 	"path/filepath"
 	"testing"
 )
@@ -106,12 +107,13 @@ func TestVariationEntriesUseSourceLeaves(t *testing.T) {
 		t.Fatal(err)
 	}
 	items := cat.MissingItems("es", false)
-	if len(items) != 1 {
+	if len(items) != 2 {
 		t.Fatalf("items = %#v", items)
 	}
-	if items[0].Source != "%lld scans" || len(items[0].VariantPath) == 0 {
-		t.Fatalf("unexpected variation item: %#v", items[0])
+	if items[1].Source != "%lld scans" || !slices.Equal(items[1].VariantPath, []string{"variations", "plural", "other", "stringUnit"}) {
+		t.Fatalf("unexpected variation item: %#v", items[1])
 	}
+	items = items[1:]
 	cat.ApplyTranslation("es", items[0].Key, items[0].VariantPath, "%lld escaneos")
 	if err := cat.Write(); err != nil {
 		t.Fatal(err)

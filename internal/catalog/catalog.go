@@ -20,9 +20,10 @@ type Catalog struct {
 }
 
 type Entry struct {
-	Comment       string
-	Localizations map[string]*Localization
-	raw           map[string]any
+	Comment         string
+	ShouldTranslate bool
+	Localizations   map[string]*Localization
+	raw             map[string]any
 }
 
 type Localization struct {
@@ -62,8 +63,8 @@ type UsageContext struct {
 }
 
 type stringLeaf struct {
-	Path []string
-	Unit StringUnit
+	Path   []string
+	Source string
 }
 
 func Load(path string) (*Catalog, error) {
@@ -96,9 +97,12 @@ func Load(path string) (*Catalog, error) {
 			return nil, fmt.Errorf("%s: string %q is not an object", path, key)
 		}
 		keys = append(keys, key)
-		entry := &Entry{raw: entryMap, Localizations: map[string]*Localization{}}
+		entry := &Entry{raw: entryMap, Localizations: map[string]*Localization{}, ShouldTranslate: true}
 		if comment, ok := entryMap["comment"].(string); ok {
 			entry.Comment = comment
+		}
+		if shouldTranslate, ok := entryMap["shouldTranslate"].(bool); ok {
+			entry.ShouldTranslate = shouldTranslate
 		}
 		if rawLocalizations, ok := entryMap["localizations"].(map[string]any); ok {
 			for language, rawLocalization := range rawLocalizations {
@@ -106,17 +110,7 @@ func Load(path string) (*Catalog, error) {
 				if !ok {
 					continue
 				}
-				loc := &Localization{raw: locMap}
-				if rawUnit, ok := locMap["stringUnit"].(map[string]any); ok {
-					unit := &StringUnit{}
-					if state, ok := rawUnit["state"].(string); ok {
-						unit.State = state
-					}
-					if text, ok := rawUnit["value"].(string); ok {
-						unit.Value = text
-					}
-					loc.StringUnit = unit
-				}
+				loc := &Localization{raw: locMap, StringUnit: parseStringUnit(locMap["stringUnit"])}
 				entry.Localizations[language] = loc
 			}
 		}
@@ -178,45 +172,28 @@ func (c *Catalog) MissingItems(language string, force bool) []Item {
 	items := []Item{}
 	for _, key := range c.OrderedKeys {
 		entry := c.Strings[key]
-		sourceLoc := c.sourceLocalization(entry)
-		targetLoc := entry.Localizations[language]
-		sourceLeaves := collectStringUnitLeaves(sourceLoc)
-
-		if len(sourceLeaves) == 0 {
-			source := c.SourceText(key, entry)
-			if strings.TrimSpace(source) == "" {
-				continue
-			}
-			if targetLoc != nil && targetLoc.Value() != "" && !force {
-				continue
-			}
-			items = append(items, Item{
-				ID:           fmt.Sprintf("%d", len(items)),
-				Key:          key,
-				Source:       source,
-				Comment:      entry.Comment,
-				Placeholders: Placeholders(source),
-			})
+		if !entry.ShouldTranslate {
 			continue
 		}
-
-		for _, sourceLeaf := range sourceLeaves {
-			source := sourceLeaf.Unit.Value
-			if strings.TrimSpace(source) == "" {
+		targetLoc := entry.Localizations[language]
+		for _, leaf := range c.targetLeaves(key, entry, language) {
+			if strings.TrimSpace(leaf.Source) == "" {
 				continue
 			}
-			if !force {
-				if targetLeaf, ok := findStringUnitLeaf(targetLoc, sourceLeaf.Path); ok && targetLeaf.Value != "" {
-					continue
-				}
+			if !force && hasTranslation(targetLoc, leaf.Path) {
+				continue
+			}
+			var variantPath []string
+			if !slices.Equal(leaf.Path, []string{"stringUnit"}) {
+				variantPath = leaf.Path
 			}
 			items = append(items, Item{
 				ID:           fmt.Sprintf("%d", len(items)),
 				Key:          key,
-				Source:       source,
+				Source:       leaf.Source,
 				Comment:      entry.Comment,
-				Placeholders: Placeholders(source),
-				VariantPath:  sourceLeaf.Path,
+				Placeholders: Placeholders(leaf.Source),
+				VariantPath:  variantPath,
 			})
 		}
 	}
@@ -227,28 +204,16 @@ func (c *Catalog) Coverage(language string) Coverage {
 	coverage := Coverage{}
 	for _, key := range c.OrderedKeys {
 		entry := c.Strings[key]
-		sourceLoc := c.sourceLocalization(entry)
-		targetLoc := entry.Localizations[language]
-		sourceLeaves := collectStringUnitLeaves(sourceLoc)
-
-		if len(sourceLeaves) == 0 {
-			source := c.SourceText(key, entry)
-			if strings.TrimSpace(source) == "" {
-				continue
-			}
-			coverage.Total++
-			if targetLoc != nil && targetLoc.Value() != "" {
-				coverage.Translated++
-			}
+		if !entry.ShouldTranslate {
 			continue
 		}
-
-		for _, sourceLeaf := range sourceLeaves {
-			if strings.TrimSpace(sourceLeaf.Unit.Value) == "" {
+		targetLoc := entry.Localizations[language]
+		for _, leaf := range c.targetLeaves(key, entry, language) {
+			if strings.TrimSpace(leaf.Source) == "" {
 				continue
 			}
 			coverage.Total++
-			if targetLeaf, ok := findStringUnitLeaf(targetLoc, sourceLeaf.Path); ok && targetLeaf.Value != "" {
+			if hasTranslation(targetLoc, leaf.Path) {
 				coverage.Translated++
 			}
 		}
@@ -262,28 +227,27 @@ func (c *Catalog) ApplyTranslation(language, key string, variantPath []string, v
 	if entry.Localizations == nil {
 		entry.Localizations = map[string]*Localization{}
 	}
-
-	if len(variantPath) == 0 || (len(variantPath) == 1 && variantPath[0] == "stringUnit") {
-		entry.Localizations[language] = &Localization{
-			StringUnit: &StringUnit{State: "translated", Value: value},
-			raw: map[string]any{
-				"stringUnit": map[string]any{
-					"state": "translated",
-					"value": value,
-				},
-			},
-		}
-		return
+	if len(variantPath) == 0 {
+		variantPath = []string{"stringUnit"}
 	}
 
 	loc := entry.Localizations[language]
-	if loc == nil || loc.raw == nil {
-		sourceLoc := c.sourceLocalization(entry)
-		loc = &Localization{raw: cloneMap(sourceLoc.raw)}
+	if loc == nil {
+		loc = &Localization{}
 		entry.Localizations[language] = loc
 	}
-	setStringUnitLeaf(loc.raw, variantPath, value)
-	loc.StringUnit = nil
+	if loc.raw == nil {
+		loc.raw = map[string]any{}
+	}
+	var sourceRaw map[string]any
+	if sourceLoc := c.sourceLocalization(entry); sourceLoc != nil {
+		sourceRaw = sourceLoc.raw
+	}
+	if variantPath[0] == "variations" {
+		delete(loc.raw, "stringUnit")
+	}
+	setStringUnitLeaf(loc.raw, sourceRaw, variantPath, value)
+	loc.StringUnit = parseStringUnit(loc.raw["stringUnit"])
 }
 
 func (c *Catalog) Write() error {
@@ -296,14 +260,6 @@ func (c *Catalog) Write() error {
 		for language, loc := range entry.Localizations {
 			if loc.raw != nil {
 				localizationsObject[language] = cloneMap(loc.raw)
-			}
-			if loc.StringUnit != nil {
-				localizationsObject[language] = map[string]any{
-					"stringUnit": map[string]any{
-						"state": loc.StringUnit.State,
-						"value": loc.StringUnit.Value,
-					},
-				}
 			}
 		}
 		if len(localizationsObject) > 0 {
@@ -335,46 +291,44 @@ func (c *Catalog) sourceLocalization(entry *Entry) *Localization {
 	return entry.Localizations["en"]
 }
 
-func collectStringUnitLeaves(localization *Localization) []stringLeaf {
-	if localization == nil {
-		return nil
+// targetLeaves lists the string units that language needs for key. Plural
+// variations use the target language's categories.
+func (c *Catalog) targetLeaves(key string, entry *Entry, language string) []stringLeaf {
+	if sourceLoc := c.sourceLocalization(entry); sourceLoc != nil && sourceLoc.raw != nil {
+		if leaves := collectTargetLeaves(sourceLoc.raw, nil, language); len(leaves) > 0 {
+			return leaves
+		}
 	}
-	if localization.StringUnit != nil {
-		return []stringLeaf{{Path: []string{"stringUnit"}, Unit: *localization.StringUnit}}
-	}
-	return collectStringUnitLeavesInMap(localization.raw, nil)
+	return []stringLeaf{{Path: []string{"stringUnit"}, Source: c.SourceText(key, entry)}}
 }
 
-func collectStringUnitLeavesInMap(current map[string]any, path []string) []stringLeaf {
-	if current == nil {
-		return nil
-	}
-	if rawUnit, ok := current["stringUnit"].(map[string]any); ok {
-		unit := StringUnit{}
-		if state, ok := rawUnit["state"].(string); ok {
-			unit.State = state
-		}
-		if value, ok := rawUnit["value"].(string); ok {
-			unit.Value = value
-		}
-		return []stringLeaf{{Path: append(append([]string{}, path...), "stringUnit"), Unit: unit}}
-	}
-
-	keys := make([]string, 0, len(current))
-	for key := range current {
-		keys = append(keys, key)
-	}
-	slices.Sort(keys)
-
+func collectTargetLeaves(node map[string]any, path []string, language string) []stringLeaf {
 	var leaves []stringLeaf
-	for _, key := range keys {
-		child, ok := current[key].(map[string]any)
-		if !ok {
+	if isPluralPath(path) {
+		for _, category := range PluralCategories(language, sortedKeys(node)) {
+			if child := pluralSourceChild(node, category); child != nil {
+				leaves = append(leaves, collectTargetLeaves(child, appendPath(path, category), language)...)
+			}
+		}
+		return leaves
+	}
+	if unit := parseStringUnit(node["stringUnit"]); unit != nil {
+		leaves = append(leaves, stringLeaf{Path: appendPath(path, "stringUnit"), Source: unit.Value})
+	}
+	for _, key := range sortedKeys(node) {
+		if key == "stringUnit" {
 			continue
 		}
-		leaves = append(leaves, collectStringUnitLeavesInMap(child, append(path, key))...)
+		if child, ok := node[key].(map[string]any); ok {
+			leaves = append(leaves, collectTargetLeaves(child, appendPath(path, key), language)...)
+		}
 	}
 	return leaves
+}
+
+func hasTranslation(localization *Localization, path []string) bool {
+	unit, ok := findStringUnitLeaf(localization, path)
+	return ok && unit.Value != ""
 }
 
 func findStringUnitLeaf(localization *Localization, path []string) (StringUnit, bool) {
@@ -383,30 +337,22 @@ func findStringUnitLeaf(localization *Localization, path []string) (StringUnit, 
 	}
 	current := localization.raw
 	for index, part := range path {
-		value, ok := current[part]
-		if !ok {
-			return StringUnit{}, false
-		}
-		child, ok := value.(map[string]any)
+		child, ok := current[part].(map[string]any)
 		if !ok {
 			return StringUnit{}, false
 		}
 		if index == len(path)-1 {
-			unit := StringUnit{}
-			if state, ok := child["state"].(string); ok {
-				unit.State = state
-			}
-			if text, ok := child["value"].(string); ok {
-				unit.Value = text
-			}
-			return unit, true
+			return *parseStringUnit(child), true
 		}
 		current = child
 	}
 	return StringUnit{}, false
 }
 
-func setStringUnitLeaf(root map[string]any, path []string, value string) {
+// setStringUnitLeaf writes a translated string unit at path. It creates missing
+// parent objects and copies their scalar fields, such as argNum and
+// formatSpecifier, from the matching source node.
+func setStringUnitLeaf(root, source map[string]any, path []string, value string) {
 	current := root
 	for index, part := range path {
 		if index == len(path)-1 {
@@ -416,13 +362,47 @@ func setStringUnitLeaf(root map[string]any, path []string, value string) {
 			}
 			return
 		}
+		var sourceChild map[string]any
+		if source != nil {
+			if isPluralPath(path[:index]) {
+				sourceChild = pluralSourceChild(source, part)
+			} else {
+				sourceChild, _ = source[part].(map[string]any)
+			}
+		}
 		child, ok := current[part].(map[string]any)
 		if !ok {
-			child = map[string]any{}
+			child = scalarFields(sourceChild)
 			current[part] = child
 		}
 		current = child
+		source = sourceChild
 	}
+}
+
+func scalarFields(node map[string]any) map[string]any {
+	fields := map[string]any{}
+	for key, value := range node {
+		if _, isMap := value.(map[string]any); !isMap {
+			fields[key] = cloneValue(value)
+		}
+	}
+	return fields
+}
+
+func parseStringUnit(value any) *StringUnit {
+	rawUnit, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	unit := &StringUnit{}
+	unit.State, _ = rawUnit["state"].(string)
+	unit.Value, _ = rawUnit["value"].(string)
+	return unit
+}
+
+func appendPath(path []string, part string) []string {
+	return append(slices.Clone(path), part)
 }
 
 func HasLinguisticText(text string) bool {
