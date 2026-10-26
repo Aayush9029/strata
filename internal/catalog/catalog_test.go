@@ -41,18 +41,6 @@ func TestMissingItemsSkipsExistingUnlessForced(t *testing.T) {
 	}
 }
 
-func TestValidateTranslationPreservesPlaceholders(t *testing.T) {
-	if err := ValidateTranslation("Buy %1$@ for %2$d days and %3$lld points", "Comprar %1$@ durante %2$d dias e %3$lld pontos"); err != nil {
-		t.Fatal(err)
-	}
-	if err := ValidateTranslation("Buy %1$@ for %2$d days and %3$lld points", "Comprar %@ durante %d dias e pontos"); err == nil {
-		t.Fatal("expected placeholder mismatch")
-	}
-	if err := ValidateTranslation("You have %#@count@", "Tienes count"); err == nil {
-		t.Fatal("expected Xcode substitution placeholder mismatch")
-	}
-}
-
 func TestApplyAndWritePreservesRootFields(t *testing.T) {
 	path := writeCatalog(t, `{
   "sourceLanguage": "en",

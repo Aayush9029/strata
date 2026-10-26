@@ -7,12 +7,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strings"
 )
-
-var PlaceholderPattern = regexp.MustCompile(`%#@[A-Za-z_][A-Za-z0-9_]*@|%(?:(?:\d+\$)?(?:[-+#0]*)(?:\d+|\*)?(?:\.(?:\d+|\*))?(?:hh|ll|[hlLzjtq])?[diouxXfFeEgGaAcCsSp@])|\\[nrt"]`)
 
 type Catalog struct {
 	Path           string
@@ -435,19 +432,6 @@ func HasLinguisticText(text string) bool {
 		}
 	}
 	return false
-}
-
-func Placeholders(text string) []string {
-	return PlaceholderPattern.FindAllString(text, -1)
-}
-
-func ValidateTranslation(source, translation string) error {
-	expected := Placeholders(source)
-	actual := Placeholders(translation)
-	if !slices.Equal(expected, actual) {
-		return fmt.Errorf("placeholder mismatch: expected %v, got %v", expected, actual)
-	}
-	return nil
 }
 
 func DiscoverCatalogs(root string) ([]string, error) {
