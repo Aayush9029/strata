@@ -17,6 +17,7 @@ type Catalog struct {
 	Strings        map[string]*Entry
 	OrderedKeys    []string
 	originalObject map[string]any
+	usesStringSets bool
 }
 
 type Entry struct {
@@ -99,6 +100,7 @@ func Load(path string) (*Catalog, error) {
 
 	keys := make([]string, 0, len(rawStrings))
 	stringsByKey := make(map[string]*Entry, len(rawStrings))
+	usesStringSets := false
 	for key, value := range rawStrings {
 		entryMap, ok := value.(map[string]any)
 		if !ok {
@@ -123,6 +125,7 @@ func Load(path string) (*Catalog, error) {
 			}
 		}
 		stringsByKey[key] = entry
+		usesStringSets = usesStringSets || hasStringSet(entry.Localizations)
 	}
 	slices.Sort(keys)
 
@@ -132,6 +135,7 @@ func Load(path string) (*Catalog, error) {
 		Strings:        stringsByKey,
 		OrderedKeys:    keys,
 		originalObject: root,
+		usesStringSets: usesStringSets,
 	}, nil
 }
 
@@ -254,6 +258,17 @@ func (c *Catalog) ApplyTranslation(language, key string, variantPath []string, v
 	if variantPath[0] == "variations" {
 		delete(loc.raw, "stringUnit")
 	}
+	if parentPath, index, ok := splitStringSetPath(variantPath); ok {
+		parent, source := ensureNode(loc.raw, sourceRaw, parentPath)
+		size := 1
+		if values, ok := stringSetValues(source); ok {
+			size = len(values)
+		}
+		delete(parent, "stringUnit")
+		setStringSetValue(parent, index, size, value)
+		loc.StringUnit = nil
+		return
+	}
 	setStringUnitLeaf(loc.raw, sourceRaw, variantPath, value)
 	loc.StringUnit = parseStringUnit(loc.raw["stringUnit"])
 }
@@ -306,6 +321,9 @@ func (c *Catalog) targetLeaves(key string, entry *Entry, language string) []stri
 			return leaves
 		}
 	}
+	if c.usesStringSets {
+		return []stringLeaf{{Path: stringSetPath(nil, 0), Source: c.SourceText(key, entry)}}
+	}
 	return []stringLeaf{{Path: []string{"stringUnit"}, Source: c.SourceText(key, entry)}}
 }
 
@@ -322,8 +340,13 @@ func collectTargetLeaves(node map[string]any, path []string, language string) []
 	if unit := parseStringUnit(node["stringUnit"]); unit != nil {
 		leaves = append(leaves, stringLeaf{Path: appendPath(path, "stringUnit"), Source: unit.Value})
 	}
+	if values, ok := stringSetValues(node); ok {
+		for index, value := range values {
+			leaves = append(leaves, stringLeaf{Path: stringSetPath(path, index), Source: value})
+		}
+	}
 	for _, key := range sortedKeys(node) {
-		if key == "stringUnit" {
+		if key == "stringUnit" || key == "stringSet" {
 			continue
 		}
 		if child, ok := node[key].(map[string]any); ok {
@@ -334,8 +357,31 @@ func collectTargetLeaves(node map[string]any, path []string, language string) []
 }
 
 func hasTranslation(localization *Localization, path []string) bool {
+	if parent, index, ok := splitStringSetPath(path); ok {
+		node, ok := findNode(localization, parent)
+		if !ok {
+			return false
+		}
+		values, _ := stringSetValues(node)
+		return index < len(values) && values[index] != ""
+	}
 	unit, ok := findStringUnitLeaf(localization, path)
 	return ok && unit.Value != ""
+}
+
+func findNode(localization *Localization, path []string) (map[string]any, bool) {
+	if localization == nil || localization.raw == nil {
+		return nil, false
+	}
+	current := localization.raw
+	for _, part := range path {
+		child, ok := current[part].(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		current = child
+	}
+	return current, true
 }
 
 func findStringUnitLeaf(localization *Localization, path []string) (StringUnit, bool) {
@@ -360,15 +406,18 @@ func findStringUnitLeaf(localization *Localization, path []string) (StringUnit, 
 // parent objects and copies their scalar fields, such as argNum and
 // formatSpecifier, from the matching source node.
 func setStringUnitLeaf(root, source map[string]any, path []string, value string) {
+	parent, _ := ensureNode(root, source, path[:len(path)-1])
+	parent[path[len(path)-1]] = map[string]any{
+		"state": "translated",
+		"value": value,
+	}
+}
+
+// ensureNode returns the object at path under root and the matching source
+// node, creating missing objects with the source node's scalar fields.
+func ensureNode(root, source map[string]any, path []string) (map[string]any, map[string]any) {
 	current := root
 	for index, part := range path {
-		if index == len(path)-1 {
-			current[part] = map[string]any{
-				"state": "translated",
-				"value": value,
-			}
-			return
-		}
 		var sourceChild map[string]any
 		if source != nil {
 			if isPluralPath(path[:index]) {
@@ -385,6 +434,7 @@ func setStringUnitLeaf(root, source map[string]any, path []string, value string)
 		current = child
 		source = sourceChild
 	}
+	return current, source
 }
 
 func scalarFields(node map[string]any) map[string]any {

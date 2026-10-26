@@ -1,0 +1,39 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "Continue Watching" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Continue Watching"
+          }
+        }
+      }
+    },
+    "Continue watching in ${applicationName}" : {
+      "localizations" : {
+        "de" : {
+          "stringSet" : {
+            "state" : "translated",
+            "values" : [
+              "Weiterschauen in ${applicationName}",
+              "Dort weitermachen, wo ich in ${applicationName} aufgehört habe"
+            ]
+          }
+        },
+        "en" : {
+          "stringSet" : {
+            "state" : "translated",
+            "values" : [
+              "Continue watching in ${applicationName}",
+              "Pick up where I left off in ${applicationName}"
+            ]
+          }
+        }
+      }
+    },
+    "Open ${applicationName}" : {}
+  },
+  "version" : "1.0"
+}

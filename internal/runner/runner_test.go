@@ -311,3 +311,45 @@ func TestParseArgsConcurrency(t *testing.T) {
 		t.Fatal("expected an error for zero concurrency")
 	}
 }
+
+// shortcutTranslator drops ${applicationName} from the second phrase.
+type shortcutTranslator struct{}
+
+func (shortcutTranslator) Translate(_ context.Context, request provider.Request) (provider.Response, error) {
+	result := map[string]string{}
+	for _, item := range request.Items {
+		text := "[" + request.LanguageCode + "] " + item.Source
+		if strings.HasSuffix(strings.Join(item.VariantPath, "."), "values.1") {
+			text = "[" + request.LanguageCode + "] no app name"
+		}
+		result[item.ID] = text
+	}
+	return provider.Response{Translations: result}, nil
+}
+
+func TestLocalizeStringSetSkipsPhraseWithoutApplicationName(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "AppShortcuts.xcstrings")
+	body := `{"sourceLanguage":"en","strings":{"Play in ${applicationName}":{"localizations":{"en":{"stringSet":{"state":"translated","values":["Play in ${applicationName}","Start ${applicationName}"]}}}}},"version":"1.0"}`
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Localize(context.Background(), Config{
+		CatalogPaths: []string{path},
+		Languages:    []string{"es"},
+		Names:        map[string]string{},
+		BatchSize:    10,
+	}, shortcutTranslator{}, ui.New(&bytes.Buffer{}, &bytes.Buffer{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Translated != 1 || len(result.Skipped) != 1 || result.Skipped[0].Variant != "stringSet.values.1" {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"[es] Play in ${applicationName}"`) || !strings.Contains(string(data), `"state" : "new"`) {
+		t.Fatalf("catalog:\n%s", data)
+	}
+}
