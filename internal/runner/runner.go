@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/huh"
@@ -44,12 +45,15 @@ var LanguageNames = map[string]string{
 	"zh-Hant": "Traditional Chinese",
 }
 
+const defaultConcurrency = 4
+
 type Config struct {
 	CatalogPaths  []string
 	Languages     []string
 	Names         map[string]string
 	Model         string
 	BatchSize     int
+	Concurrency   int
 	Force         bool
 	DryRun        bool
 	ProviderName  string
@@ -67,6 +71,7 @@ type Result struct {
 	Planned    int
 	Copied     int
 	Batches    int
+	Skipped    []Skip
 	Usage      provider.Usage
 	Duration   time.Duration
 }
@@ -132,10 +137,25 @@ func runTranslate(ctx context.Context, args []string, out, stderr io.Writer) err
 			printSummary(printer, config, result, true)
 			return nil
 		}
+		printSkipped(printer, result.Skipped)
 		return err
 	}
 	printSummary(printer, config, result, false)
 	return nil
+}
+
+func printSkipped(printer ui.Printer, skipped []Skip) {
+	if len(skipped) == 0 {
+		return
+	}
+	printer.Warning("skipped %d strings that failed validation after retries:", len(skipped))
+	for _, skip := range skipped {
+		key := skip.Key
+		if skip.Variant != "" {
+			key += " (" + skip.Variant + ")"
+		}
+		printer.Warning("  %s [%s] %q: %s", ui.ShortPath(skip.Catalog), skip.Language, key, skip.Reason)
+	}
 }
 
 func printSummary(printer ui.Printer, config Config, result Result, canceled bool) {
@@ -156,6 +176,7 @@ func printSummary(printer ui.Printer, config Config, result Result, canceled boo
 	if config.DryRun {
 		return
 	}
+	printSkipped(printer, result.Skipped)
 	if result.Usage.TotalTokens > 0 || result.Usage.HasCost {
 		if result.Usage.HasCost {
 			printer.Dim("OpenRouter usage: %d prompt + %d completion = %d tokens, %.6f credits", result.Usage.PromptTokens, result.Usage.CompletionTokens, result.Usage.TotalTokens, result.Usage.Cost)
@@ -249,51 +270,39 @@ func Localize(ctx context.Context, config Config, translator provider.Translator
 				Existing:      coverage.Translated,
 				Total:         coverage.Total,
 			}
-			translated, copied, batches, usage, err := localizeCatalog(runCtx, cat, language, displayName, items, config, translator, printer, progress, event)
+			outcome, err := localizeCatalog(runCtx, cat, language, displayName, items, config, translator, printer, progress, event)
+			filled := outcome.Translated + outcome.Copied
+			result.Planned += filled
+			if !config.DryRun {
+				result.Translated += filled
+			}
+			result.Copied += outcome.Copied
+			result.Batches += outcome.Batches
+			result.Usage = result.Usage.Add(outcome.Usage)
+			result.Skipped = append(result.Skipped, outcome.Skipped...)
+			if !config.DryRun && filled > 0 {
+				if writeErr := cat.Write(); writeErr != nil {
+					return result, writeErr
+				}
+			}
 			if err != nil {
-				result.Planned += translated + copied
-				if !config.DryRun {
-					result.Translated += translated + copied
-				}
-				result.Copied += copied
-				result.Batches += batches
-				result.Usage = result.Usage.Add(usage)
-				if !config.DryRun && translated+copied > 0 {
-					if writeErr := cat.Write(); writeErr != nil {
-						return result, writeErr
-					}
-				}
 				result.Duration = time.Since(started)
 				return result, err
 			}
-			result.Planned += translated + copied
-			if !config.DryRun {
-				result.Translated += translated + copied
-			}
-			result.Copied += copied
-			result.Batches += batches
-			result.Usage = result.Usage.Add(usage)
 			if printer.IsTerminal() {
 				event.Phase = "catalog"
-				event.Filled = translated + copied
-				event.Copied = copied
+				event.Filled = filled
+				event.Copied = outcome.Copied
 				if config.DryRun {
 					event.Message = "dry run complete"
 				} else {
 					event.Message = "catalog complete"
 				}
 				progress.Send(event)
+			} else if config.DryRun {
+				printer.Status("%s: would fill %d/%d", cat.Path, filled, len(items))
 			} else {
-				if config.DryRun {
-					printer.Status("%s: would fill %d/%d", cat.Path, translated+copied, len(items))
-				} else {
-					printer.Status("%s: %d/%d filled", cat.Path, translated+copied, len(items))
-				}
-			}
-			if !config.DryRun && translated+copied > 0 {
-				if err := cat.Write(); err != nil {
-					return result, err
-				}
+				printer.Status("%s: %d/%d filled", cat.Path, filled, len(items))
 			}
 		}
 	}
@@ -301,87 +310,195 @@ func Localize(ctx context.Context, config Config, translator provider.Translator
 	return result, nil
 }
 
-func localizeCatalog(ctx context.Context, cat *catalog.Catalog, language, displayName string, items []catalog.Item, config Config, translator provider.Translator, printer ui.Printer, progress *ui.Progress, event ui.ProgressEvent) (int, int, int, provider.Usage, error) {
-	translated := 0
-	copied := 0
-	usage := provider.Usage{}
+type catalogOutcome struct {
+	Translated int
+	Copied     int
+	Batches    int
+	Usage      provider.Usage
+	Skipped    []Skip
+}
+
+// localizeCatalog translates items for one catalog and language. Batches run
+// on a worker pool; results are applied and written under one lock, so a
+// stopped run keeps every completed batch.
+func localizeCatalog(ctx context.Context, cat *catalog.Catalog, language, displayName string, items []catalog.Item, config Config, translator provider.Translator, printer ui.Printer, progress *ui.Progress, event ui.ProgressEvent) (catalogOutcome, error) {
+	outcome := catalogOutcome{}
 	toTranslate := []catalog.Item{}
 	for _, item := range items {
 		if !catalog.HasLinguisticText(item.Source) {
 			if !config.DryRun {
 				cat.ApplyTranslation(language, item.Key, item.VariantPath, item.Source)
 			}
-			copied++
+			outcome.Copied++
 			continue
 		}
 		toTranslate = append(toTranslate, item)
 	}
-	event.Copied = copied
-	event.Filled = copied
-	event.BatchTotal = batchCount(len(toTranslate), config.BatchSize)
-	if printer.IsTerminal() {
-		event.Message = "prepared batches"
-		progress.Send(event)
-	}
+	batches := splitBatches(toTranslate, config.BatchSize)
+	event.Copied = outcome.Copied
+	event.Filled = outcome.Copied
+	event.BatchTotal = len(batches)
+	event.Message = "prepared batches"
+	progress.Send(event)
 
-	batches := 0
-	for start := 0; start < len(toTranslate); start += config.BatchSize {
-		end := min(start+config.BatchSize, len(toTranslate))
-		batch := toTranslate[start:end]
-		batches++
-		event.BatchIndex = batches
-		event.Filled = translated + copied
-		event.Message = "translating batch"
-		if config.DryRun {
-			event.Message = "planning batch"
-		}
-		progress.Send(event)
-		if config.DryRun {
+	if config.DryRun {
+		for _, batch := range batches {
+			outcome.Batches++
+			outcome.Translated += len(batch)
 			if !printer.IsTerminal() {
 				printer.Dim("  %s: would translate %d strings", cat.Path, len(batch))
 			}
-			translated += len(batch)
-			event.Filled = translated + copied
+			event.BatchIndex = outcome.Batches
+			event.Filled = outcome.Translated + outcome.Copied
 			event.Message = "batch planned"
 			progress.Send(event)
-			continue
 		}
-		response, err := translateWithRetry(ctx, translator, provider.Request{
-			LanguageCode: language,
-			LanguageName: displayName,
-			Items:        batch,
-			Project:      config.Project,
-		})
-		if err != nil {
-			return translated, copied, batches, usage, err
-		}
-		usage = usage.Add(response.Usage)
-		for _, item := range batch {
-			text, ok := response.Translations[item.ID]
-			if !ok || strings.TrimSpace(text) == "" {
-				return translated, copied, batches, usage, fmt.Errorf("%s: missing translation for key %q", cat.Path, item.Key)
-			}
-			if err := catalog.ValidateTranslation(item.Source, text); err != nil {
-				return translated, copied, batches, usage, fmt.Errorf("%s: %q: %w", cat.Path, item.Key, err)
-			}
-			if err := validateProtectedTerms(item.Source, text, config.Project.AllProtectedTerms()); err != nil {
-				return translated, copied, batches, usage, fmt.Errorf("%s: %q: %w", cat.Path, item.Key, err)
-			}
-			cat.ApplyTranslation(language, item.Key, item.VariantPath, text)
-			translated++
-		}
-		event.Filled = translated + copied
-		event.Message = "batch complete"
-		progress.Send(event)
+		return outcome, nil
 	}
-	return translated, copied, batches, usage, nil
+
+	workCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var mu sync.Mutex
+	var firstErr error
+	fail := func(err error) {
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+	}
+	jobs := make(chan []catalog.Item)
+	var wg sync.WaitGroup
+	for range max(1, min(config.Concurrency, len(batches))) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for batch := range jobs {
+				result, err := translateBatch(workCtx, translator, provider.Request{
+					LanguageCode: language,
+					LanguageName: displayName,
+					Items:        batch,
+					Project:      config.Project,
+				}, cat.Path)
+				mu.Lock()
+				outcome.Usage = outcome.Usage.Add(result.Usage)
+				if err != nil {
+					fail(err)
+					mu.Unlock()
+					continue
+				}
+				for _, translation := range result.Translations {
+					cat.ApplyTranslation(language, translation.Item.Key, translation.Item.VariantPath, translation.Text)
+				}
+				outcome.Translated += len(result.Translations)
+				outcome.Skipped = append(outcome.Skipped, result.Skipped...)
+				outcome.Batches++
+				if err := cat.Write(); err != nil {
+					fail(err)
+				}
+				event.BatchIndex = outcome.Batches
+				event.Filled = outcome.Translated + outcome.Copied
+				event.Message = "batch complete"
+				progress.Send(event)
+				mu.Unlock()
+			}
+		}()
+	}
+feed:
+	for _, batch := range batches {
+		select {
+		case jobs <- batch:
+		case <-workCtx.Done():
+			break feed
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	if firstErr != nil {
+		return outcome, firstErr
+	}
+	return outcome, ctx.Err()
 }
 
-func batchCount(itemCount, batchSize int) int {
-	if itemCount == 0 {
-		return 0
+func splitBatches(items []catalog.Item, size int) [][]catalog.Item {
+	var batches [][]catalog.Item
+	for start := 0; start < len(items); start += size {
+		batches = append(batches, items[start:min(start+size, len(items))])
 	}
-	return (itemCount + batchSize - 1) / batchSize
+	return batches
+}
+
+// Skip records a string that still failed validation after all retries.
+type Skip struct {
+	Catalog  string
+	Language string
+	Key      string
+	Variant  string
+	Reason   string
+}
+
+type acceptedTranslation struct {
+	Item catalog.Item
+	Text string
+}
+
+type batchResult struct {
+	Translations []acceptedTranslation
+	Skipped      []Skip
+	Usage        provider.Usage
+}
+
+// validationRetries is the number of follow-up requests for items that fail
+// validation. Each follow-up sends only the failed items with the reason.
+const validationRetries = 2
+
+func translateBatch(ctx context.Context, translator provider.Translator, request provider.Request, catalogPath string) (batchResult, error) {
+	result := batchResult{}
+	pending := request.Items
+	terms := request.Project.AllProtectedTerms()
+	for attempt := 0; attempt <= validationRetries && len(pending) > 0; attempt++ {
+		request.Items = pending
+		response, err := translateWithRetry(ctx, translator, request)
+		if err != nil {
+			return result, err
+		}
+		result.Usage = result.Usage.Add(response.Usage)
+		var failed []catalog.Item
+		for _, item := range pending {
+			text, ok := response.Translations[item.ID]
+			reason := validateItem(item, text, ok, terms)
+			if reason == "" {
+				result.Translations = append(result.Translations, acceptedTranslation{Item: item, Text: text})
+				continue
+			}
+			item.PreviousTranslation = text
+			item.PreviousError = reason
+			failed = append(failed, item)
+		}
+		pending = failed
+	}
+	for _, item := range pending {
+		result.Skipped = append(result.Skipped, Skip{
+			Catalog:  catalogPath,
+			Language: request.LanguageCode,
+			Key:      item.Key,
+			Variant:  strings.Join(item.VariantPath, "."),
+			Reason:   item.PreviousError,
+		})
+	}
+	return result, nil
+}
+
+func validateItem(item catalog.Item, text string, ok bool, terms []string) string {
+	if !ok || strings.TrimSpace(text) == "" {
+		return "missing translation"
+	}
+	if err := catalog.ValidateTranslation(item.Source, text); err != nil {
+		return err.Error()
+	}
+	if err := validateProtectedTerms(item.Source, text, terms); err != nil {
+		return err.Error()
+	}
+	return ""
 }
 
 func translateWithRetry(ctx context.Context, translator provider.Translator, request provider.Request) (provider.Response, error) {
@@ -412,6 +529,7 @@ func parseArgs(args []string) (Config, error) {
 		Names:        map[string]string{},
 		Model:        envDefault("OPENROUTER_MODEL", "google/gemini-2.5-flash"),
 		BatchSize:    40,
+		Concurrency:  defaultConcurrency,
 		ProviderName: "openrouter",
 		Timeout:      120 * time.Second,
 	}
@@ -419,6 +537,7 @@ func parseArgs(args []string) (Config, error) {
 	flags.Var(&names, "name", "Language display override as code=name.")
 	flags.StringVar(&config.Model, "model", config.Model, "OpenRouter model name.")
 	flags.IntVar(&config.BatchSize, "batch-size", config.BatchSize, "Strings per translation request.")
+	flags.IntVar(&config.Concurrency, "concurrency", config.Concurrency, "Translation requests to run in parallel.")
 	flags.BoolVar(&config.Force, "force", false, "Translate even when a target localization already exists.")
 	flags.BoolVar(&config.DryRun, "dry-run", false, "Report work without writing files or calling the provider.")
 	flags.StringVar(&config.ProviderName, "provider", config.ProviderName, "Translation provider: openrouter or mock.")
@@ -431,6 +550,9 @@ func parseArgs(args []string) (Config, error) {
 	}
 	if config.BatchSize <= 0 {
 		return config, errors.New("--batch-size must be greater than zero")
+	}
+	if config.Concurrency <= 0 {
+		return config, errors.New("--concurrency must be greater than zero")
 	}
 	config.Timeout = time.Duration(*timeoutSeconds) * time.Second
 	config.Languages = languages
@@ -604,6 +726,9 @@ func mergeProjectConfig(base, override provider.ProjectConfig) provider.ProjectC
 	if override.BatchSize > 0 {
 		base.BatchSize = override.BatchSize
 	}
+	if override.Concurrency > 0 {
+		base.Concurrency = override.Concurrency
+	}
 	if override.BundleID != "" {
 		base.BundleID = override.BundleID
 	}
@@ -657,6 +782,9 @@ func applyProjectDefaults(config *Config) {
 	}
 	if config.Project.BatchSize > 0 && config.BatchSize == 40 {
 		config.BatchSize = config.Project.BatchSize
+	}
+	if config.Project.Concurrency > 0 && config.Concurrency == defaultConcurrency {
+		config.Concurrency = config.Project.Concurrency
 	}
 }
 
@@ -1258,6 +1386,7 @@ Options:
   --model <name>        OpenRouter model picker. Defaults to OPENROUTER_MODEL or google/gemini-2.5-flash.
   --config <path>       JSON project config. Defaults to strata.json when present.
   --batch-size <n>      Strings per provider request. Default: 40.
+  --concurrency <n>     Provider requests to run in parallel. Default: 4.
   --force               Re-translate existing target values.
   --dry-run             Count missing strings without writing or calling the provider.
   --provider <name>     openrouter or mock. Default: openrouter.
@@ -1265,11 +1394,4 @@ Options:
   --timeout <seconds>   Provider timeout. Default: 120.
   --version             Print version.
 `)+"\n")
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

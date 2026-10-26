@@ -6,6 +6,7 @@ import (
 	"io"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/progress"
@@ -32,11 +33,15 @@ type ProgressEvent struct {
 	Message       string
 }
 
+// Progress is safe for concurrent use. Send never blocks after the UI stops.
 type Progress struct {
 	enabled bool
 	events  chan ProgressEvent
 	program *tea.Program
 	cancel  context.CancelFunc
+	done    chan struct{}
+	mu      sync.Mutex
+	closed  bool
 }
 
 func NewProgress(ctx context.Context, out io.Writer, enabled bool) (*Progress, context.Context) {
@@ -55,7 +60,9 @@ func NewProgress(ctx context.Context, out io.Writer, enabled bool) (*Progress, c
 		),
 		width: 72,
 	}, tea.WithOutput(out))
+	view.done = make(chan struct{})
 	go func() {
+		defer close(view.done)
 		_, _ = view.program.Run()
 	}()
 	return view, runCtx
@@ -65,17 +72,28 @@ func (p *Progress) Send(event ProgressEvent) {
 	if p == nil || !p.enabled {
 		return
 	}
-	p.events <- event
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return
+	}
+	select {
+	case p.events <- event:
+	case <-p.done:
+	}
 }
 
 func (p *Progress) Close() {
 	if p == nil || !p.enabled {
 		return
 	}
-	close(p.events)
-	if p.program != nil {
-		p.program.Wait()
+	p.mu.Lock()
+	if !p.closed {
+		p.closed = true
+		close(p.events)
 	}
+	p.mu.Unlock()
+	<-p.done
 }
 
 type progressModel struct {

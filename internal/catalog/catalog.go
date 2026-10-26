@@ -44,6 +44,10 @@ type Item struct {
 	Placeholders []string       `json:"placeholders"`
 	VariantPath  []string       `json:"variant_path,omitempty"`
 	UsageContext []UsageContext `json:"usage_context,omitempty"`
+	// PreviousTranslation and PreviousError describe a rejected attempt, so
+	// the model can fix it on retry.
+	PreviousTranslation string `json:"previous_translation,omitempty"`
+	PreviousError       string `json:"previous_error,omitempty"`
 }
 
 type Coverage struct {
