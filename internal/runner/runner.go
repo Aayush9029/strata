@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
@@ -800,15 +802,46 @@ func joinNonEmpty(values ...string) string {
 
 func validateProtectedTerms(source, translation string, terms []string) error {
 	for _, term := range terms {
-		if containsFold(source, term) && !containsFold(translation, term) {
+		if containsWord(source, term) && !containsWord(translation, term) {
 			return fmt.Errorf("protected term %q was changed or removed", term)
 		}
 	}
 	return nil
 }
 
-func containsFold(value, needle string) bool {
-	return strings.Contains(strings.ToLower(value), strings.ToLower(needle))
+// containsWord reports whether text contains term as a whole word or phrase,
+// case-sensitively. A word boundary is any rune that is not a letter or digit.
+// Han, kana, Hangul, and Thai do not count as letters here, because those
+// scripts write words without spaces ("Plexで" contains "Plex").
+func containsWord(text, term string) bool {
+	if term == "" {
+		return false
+	}
+	for offset := 0; offset <= len(text)-len(term); {
+		index := strings.Index(text[offset:], term)
+		if index < 0 {
+			return false
+		}
+		start := offset + index
+		end := start + len(term)
+		before, _ := utf8.DecodeLastRuneInString(text[:start])
+		after, _ := utf8.DecodeRuneInString(text[end:])
+		first, _ := utf8.DecodeRuneInString(term)
+		last, _ := utf8.DecodeLastRuneInString(term)
+		if (start == 0 || !isWordRune(first) || !isWordRune(before)) && (end == len(text) || !isWordRune(last) || !isWordRune(after)) {
+			return true
+		}
+		_, size := utf8.DecodeRuneInString(text[start:])
+		offset = start + size
+	}
+	return false
+}
+
+func isWordRune(char rune) bool {
+	if unicode.In(char, unicode.Han, unicode.Hiragana, unicode.Katakana, unicode.Hangul, unicode.Thai) {
+		return false
+	}
+	return unicode.IsLetter(char) || unicode.IsDigit(char)
 }
 
 func splitCSV(value string) []string {

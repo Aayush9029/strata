@@ -89,11 +89,37 @@ func TestLoadContextJSON(t *testing.T) {
 }
 
 func TestValidateProtectedTerms(t *testing.T) {
-	if err := validateProtectedTerms("Blume Pro is active", "Blume Pro está activo", []string{"Blume"}); err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name        string
+		source      string
+		translation string
+		terms       []string
+		valid       bool
+	}{
+		{"kept", "Blume Pro is active", "Blume Pro está activo", []string{"Blume"}, true},
+		{"changed", "Blume Pro is active", "Bloom Pro está activo", []string{"Blume"}, false},
+		{"lowercase source is not the term", "blume Pro is active", "Bloom Pro está activo", []string{"Blume"}, true},
+		{"substring in source is ignored", "This is complex", "Esto es complejo", []string{"Plex"}, true},
+		{"substring in source is ignored for Box", "Show Checkbox", "Kontrollkästchen anzeigen", []string{"Box"}, true},
+		{"substring in translation does not count", "Open Plex", "Abrir Complexo", []string{"Plex"}, false},
+		{"case changed", "Open Plex", "Abrir PLEX", []string{"Plex"}, false},
+		{"phrase kept", "Connect Google Drive", "Google Drive verbinden", []string{"Google Drive"}, true},
+		{"phrase split", "Connect Google Drive", "Google-Laufwerk verbinden", []string{"Google Drive"}, false},
+		{"punctuation boundary", "Watch on Apple TV.", "Ver en «Apple TV».", []string{"Apple TV"}, true},
+		{"cjk neighbor", "Open Plex", "Plexを開く", []string{"Plex"}, true},
+		{"hangul neighbor", "Open Plex", "Plex에서 열기", []string{"Plex"}, true},
+		{"second occurrence matches", "Plex", "Plexus Plex", []string{"Plex"}, true},
 	}
-	if err := validateProtectedTerms("blume Pro is active", "Bloom Pro está activo", []string{"Blume"}); err == nil {
-		t.Fatal("expected protected term validation error")
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateProtectedTerms(test.source, test.translation, test.terms)
+			if test.valid && err != nil {
+				t.Fatalf("expected valid, got %v", err)
+			}
+			if !test.valid && err == nil {
+				t.Fatal("expected an error")
+			}
+		})
 	}
 }
 
