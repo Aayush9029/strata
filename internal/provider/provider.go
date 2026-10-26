@@ -105,17 +105,7 @@ func (o *OpenRouter) Translate(ctx context.Context, request Request) (Response, 
 	if o.APIKey == "" {
 		return Response{}, fmt.Errorf("OPENROUTER_API_KEY is required")
 	}
-	rules := []string{
-		"Return strict JSON only: an object mapping each id to its translated string.",
-		"Preserve brand names and non-translatable terms exactly.",
-		"Preserve all printf placeholders exactly, including order markers like %1$@ and integer placeholders like %lld.",
-		"Preserve escaped newlines as newlines where present.",
-		"Do not translate product identifiers, URLs, bundle IDs, route names, or SF Symbol names.",
-		"Keep mobile app copy natural, concise, and platform appropriate.",
-	}
-	for _, term := range request.Project.AllProtectedTerms() {
-		rules = append(rules, fmt.Sprintf("Do not translate this term: %s.", term))
-	}
+	rules := promptRules(request.Project)
 	contextText := request.Project.AppContext
 	if strings.TrimSpace(contextText) == "" {
 		contextText = request.Project.Description
@@ -235,6 +225,29 @@ func FromEnvironment(name, model string, timeout time.Duration) (Translator, err
 	default:
 		return nil, fmt.Errorf("unknown provider %q", name)
 	}
+}
+
+func promptRules(project ProjectConfig) []string {
+	rules := []string{
+		"Return strict JSON only: an object that maps each item id to its translated string.",
+		"Keep every placeholder in an item's placeholders list exactly as written: printf specifiers such as %@, %lld, and %1$@, %#@name@ substitution tokens, %arg, and App Shortcuts tokens such as ${applicationName}. Do not translate, add, or remove placeholders.",
+		"If the target word order needs a different argument order, use positional specifiers such as %1$@ and %2$@ (keep the type, e.g. %2$lld).",
+		"variant_path shows where the string goes. After plural comes a CLDR plural category (zero, one, two, few, many, or other): write the grammatical form of the target language for that category. After device comes a device name such as iphone, ipad, or mac: write the text for that device.",
+		"If an item has previous_error, your previous translation (previous_translation) was rejected for that reason. Fix the problem in the new translation.",
+		"Use the comment and usage_context to understand each string. usage_context gives the Swift file, type, view, function, and code snippet; role names the UI element (button, navigation title, alert title, and so on); interpolations name the Swift expressions that fill the placeholders, in order.",
+		"Keep UI strings concise. Button labels, titles, tabs, and menu items must stay short.",
+		"Use the platform's native terminology: Apple's official localized UI terms for the target language, for example \"Einstellungen\" for Settings in German.",
+		"Do not add trailing punctuation that the source does not have.",
+		"Preserve leading and trailing whitespace, newlines, and escape sequences such as \\n exactly.",
+		"Use the typographic quotation marks that are correct for the target language.",
+		"Preserve brand names and non-translatable terms exactly.",
+		"Do not translate product identifiers, URLs, bundle IDs, route names, or SF Symbol names.",
+		"Keep mobile app copy natural and platform appropriate.",
+	}
+	for _, term := range project.AllProtectedTerms() {
+		rules = append(rules, fmt.Sprintf("Do not translate this term: %s.", term))
+	}
+	return rules
 }
 
 func mustJSON(value any) string {
